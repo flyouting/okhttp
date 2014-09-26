@@ -19,15 +19,19 @@ import com.squareup.okhttp.internal.Util;
 import java.io.File;
 import java.io.FileWriter;
 import java.io.IOException;
-import okio.OkBuffer;
+import java.net.URI;
+import java.net.URL;
+
+import okio.Buffer;
 import org.junit.Test;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertNull;
 
 public final class RequestTest {
   @Test public void string() throws Exception {
     MediaType contentType = MediaType.parse("text/plain; charset=utf-8");
-    Request.Body body = Request.Body.create(contentType, "abc".getBytes(Util.UTF_8));
+    RequestBody body = RequestBody.create(contentType, "abc".getBytes(Util.UTF_8));
     assertEquals(contentType, body.contentType());
     assertEquals(3, body.contentLength());
     assertEquals("616263", bodyToHex(body));
@@ -36,7 +40,7 @@ public final class RequestTest {
 
   @Test public void stringWithDefaultCharsetAdded() throws Exception {
     MediaType contentType = MediaType.parse("text/plain");
-    Request.Body body = Request.Body.create(contentType, "\u0800");
+    RequestBody body = RequestBody.create(contentType, "\u0800");
     assertEquals(MediaType.parse("text/plain; charset=utf-8"), body.contentType());
     assertEquals(3, body.contentLength());
     assertEquals("e0a080", bodyToHex(body));
@@ -44,7 +48,7 @@ public final class RequestTest {
 
   @Test public void stringWithNonDefaultCharsetSpecified() throws Exception {
     MediaType contentType = MediaType.parse("text/plain; charset=utf-16be");
-    Request.Body body = Request.Body.create(contentType, "\u0800");
+    RequestBody body = RequestBody.create(contentType, "\u0800");
     assertEquals(contentType, body.contentType());
     assertEquals(2, body.contentLength());
     assertEquals("0800", bodyToHex(body));
@@ -52,7 +56,7 @@ public final class RequestTest {
 
   @Test public void byteArray() throws Exception {
     MediaType contentType = MediaType.parse("text/plain");
-    Request.Body body = Request.Body.create(contentType, "abc".getBytes(Util.UTF_8));
+    RequestBody body = RequestBody.create(contentType, "abc".getBytes(Util.UTF_8));
     assertEquals(contentType, body.contentType());
     assertEquals(3, body.contentLength());
     assertEquals("616263", bodyToHex(body));
@@ -66,16 +70,52 @@ public final class RequestTest {
     writer.close();
 
     MediaType contentType = MediaType.parse("text/plain");
-    Request.Body body = Request.Body.create(contentType, file);
+    RequestBody body = RequestBody.create(contentType, file);
     assertEquals(contentType, body.contentType());
     assertEquals(3, body.contentLength());
     assertEquals("616263", bodyToHex(body));
     assertEquals("Retransmit body", "616263", bodyToHex(body));
   }
 
-  private String bodyToHex(Request.Body body) throws IOException {
-    OkBuffer buffer = new OkBuffer();
+  /** Common verbs used for apis such as GitHub, AWS, and Google Cloud. */
+  @Test public void crudVerbs() {
+    MediaType contentType = MediaType.parse("application/json");
+    RequestBody body = RequestBody.create(contentType, "{}");
+
+    Request get = new Request.Builder().url("http://localhost/api").get().build();
+    assertEquals("GET", get.method());
+    assertNull(get.body());
+
+    Request head = new Request.Builder().url("http://localhost/api").head().build();
+    assertEquals("HEAD", head.method());
+    assertNull(head.body());
+
+    Request delete = new Request.Builder().url("http://localhost/api").delete().build();
+    assertEquals("DELETE", delete.method());
+    assertNull(delete.body());
+
+    Request post = new Request.Builder().url("http://localhost/api").post(body).build();
+    assertEquals("POST", post.method());
+    assertEquals(body, post.body());
+
+    Request put = new Request.Builder().url("http://localhost/api").put(body).build();
+    assertEquals("PUT", put.method());
+    assertEquals(body, put.body());
+
+    Request patch = new Request.Builder().url("http://localhost/api").patch(body).build();
+    assertEquals("PATCH", patch.method());
+    assertEquals(body, patch.body());
+  }
+
+  @Test public void uninitializedURI() throws Exception {
+    Request request = new Request.Builder().url("http://localhost/api").build();
+    assertEquals(new URI("http://localhost/api"), request.uri());
+    assertEquals(new URL("http://localhost/api"), request.url());
+  }
+
+  private String bodyToHex(RequestBody body) throws IOException {
+    Buffer buffer = new Buffer();
     body.writeTo(buffer);
-    return buffer.readByteString(buffer.size()).hex();
+    return buffer.readByteString().hex();
   }
 }

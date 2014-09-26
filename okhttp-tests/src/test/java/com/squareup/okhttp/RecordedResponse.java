@@ -15,14 +15,15 @@
  */
 package com.squareup.okhttp;
 
-import java.util.ArrayList;
+import java.io.IOException;
+import java.net.URL;
 import java.util.Arrays;
-import java.util.List;
 
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
-import static org.junit.Assert.fail;
+import static org.junit.Assert.assertTrue;
 
 /**
  * A received response or failure recorded by the response recorder.
@@ -31,13 +32,28 @@ public class RecordedResponse {
   public final Request request;
   public final Response response;
   public final String body;
-  public final Failure failure;
+  public final IOException failure;
 
-  RecordedResponse(Request request, Response response, String body, Failure failure) {
+  RecordedResponse(Request request, Response response, String body, IOException failure) {
     this.request = request;
     this.response = response;
     this.body = body;
     this.failure = failure;
+  }
+
+  public RecordedResponse assertRequestUrl(URL url) {
+    assertEquals(url, request.url());
+    return this;
+  }
+
+  public RecordedResponse assertRequestMethod(String method) {
+    assertEquals(method, request.method());
+    return this;
+  }
+
+  public RecordedResponse assertRequestHeader(String name, String... values) {
+    assertEquals(Arrays.asList(values), request.headers(name));
+    return this;
   }
 
   public RecordedResponse assertCode(int expectedCode) {
@@ -45,15 +61,18 @@ public class RecordedResponse {
     return this;
   }
 
-  public RecordedResponse assertContainsHeaders(String... expectedHeaders) {
-    List<String> actualHeaders = new ArrayList<String>();
-    Headers headers = response.headers();
-    for (int i = 0; i < headers.size(); i++) {
-      actualHeaders.add(headers.name(i) + ": " + headers.value(i));
-    }
-    if (!actualHeaders.containsAll(Arrays.asList(expectedHeaders))) {
-      fail("Expected: " + actualHeaders + "\nto contain: " + Arrays.toString(expectedHeaders));
-    }
+  public RecordedResponse assertSuccessful() {
+    assertTrue(response.isSuccessful());
+    return this;
+  }
+
+  public RecordedResponse assertNotSuccessful() {
+    assertFalse(response.isSuccessful());
+    return this;
+  }
+
+  public RecordedResponse assertHeader(String name, String... values) {
+    assertEquals(Arrays.asList(values), response.headers(name));
     return this;
   }
 
@@ -73,18 +92,52 @@ public class RecordedResponse {
   }
 
   /**
-   * Asserts that the current response was redirected and returns a new recorded
-   * response for the original request.
+   * Asserts that the current response was redirected and returns the prior
+   * response.
    */
-  public RecordedResponse redirectedBy() {
-    Response redirectedBy = response.redirectedBy();
-    assertNotNull(redirectedBy);
-    assertNull(redirectedBy.body());
-    return new RecordedResponse(redirectedBy.request(), redirectedBy, null, null);
+  public RecordedResponse priorResponse() {
+    Response priorResponse = response.priorResponse();
+    assertNotNull(priorResponse);
+    assertNull(priorResponse.body());
+    return new RecordedResponse(priorResponse.request(), priorResponse, null, null);
+  }
+
+  /**
+   * Asserts that the current response used the network and returns the network
+   * response.
+   */
+  public RecordedResponse networkResponse() {
+    Response networkResponse = response.networkResponse();
+    assertNotNull(networkResponse);
+    assertNull(networkResponse.body());
+    return new RecordedResponse(networkResponse.request(), networkResponse, null, null);
+  }
+
+  /** Asserts that the current response didn't use the network. */
+  public RecordedResponse assertNoNetworkResponse() {
+    assertNull(response.networkResponse());
+    return this;
+  }
+
+  /** Asserts that the current response didn't use the cache. */
+  public RecordedResponse assertNoCacheResponse() {
+    assertNull(response.cacheResponse());
+    return this;
+  }
+
+  /**
+   * Asserts that the current response used the cache and returns the cache
+   * response.
+   */
+  public RecordedResponse cacheResponse() {
+    Response cacheResponse = response.cacheResponse();
+    assertNotNull(cacheResponse);
+    assertNull(cacheResponse.body());
+    return new RecordedResponse(cacheResponse.request(), cacheResponse, null, null);
   }
 
   public void assertFailure(String message) {
     assertNotNull(failure);
-    assertEquals(message, failure.exception().getMessage());
+    assertEquals(message, failure.getMessage());
   }
 }

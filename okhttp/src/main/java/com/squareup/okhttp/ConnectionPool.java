@@ -51,7 +51,7 @@ import java.util.concurrent.TimeUnit;
  * parameters do so before making HTTP connections, and that this class is
  * initialized lazily.
  */
-public class ConnectionPool {
+public final class ConnectionPool {
   private static final int MAX_CONNECTIONS_TO_CLEANUP = 2;
   private static final long DEFAULT_KEEP_ALIVE_DURATION_MS = 5 * 60 * 1000; // 5 min
 
@@ -76,7 +76,7 @@ public class ConnectionPool {
   private final int maxIdleConnections;
   private final long keepAliveDurationNs;
 
-  private final LinkedList<Connection> connections = new LinkedList<Connection>();
+  private final LinkedList<Connection> connections = new LinkedList<>();
 
   /** We use a single background thread to cleanup expired connections. */
   private final ExecutorService executorService = new ThreadPoolExecutor(0, 1,
@@ -84,7 +84,7 @@ public class ConnectionPool {
       Util.threadFactory("OkHttp ConnectionPool", true));
   private final Runnable connectionsCleanupRunnable = new Runnable() {
     @Override public void run() {
-      List<Connection> expiredConnections = new ArrayList<Connection>(MAX_CONNECTIONS_TO_CLEANUP);
+      List<Connection> expiredConnections = new ArrayList<>(MAX_CONNECTIONS_TO_CLEANUP);
       int idleConnectionCount = 0;
       synchronized (ConnectionPool.this) {
         for (ListIterator<Connection> i = connections.listIterator(connections.size());
@@ -110,7 +110,7 @@ public class ConnectionPool {
         }
       }
       for (Connection expiredConnection : expiredConnections) {
-        Util.closeQuietly(expiredConnection);
+        Util.closeQuietly(expiredConnection.getSocket());
       }
     }
   };
@@ -127,7 +127,7 @@ public class ConnectionPool {
   List<Connection> getConnections() {
     waitForCleanupCallableToRun();
     synchronized (this) {
-      return new ArrayList<Connection>(connections);
+      return new ArrayList<>(connections);
     }
   }
 
@@ -189,7 +189,7 @@ public class ConnectionPool {
         try {
           Platform.get().tagSocket(connection.getSocket());
         } catch (SocketException e) {
-          Util.closeQuietly(connection);
+          Util.closeQuietly(connection.getSocket());
           // When unable to tag, skip recycling and close
           Platform.get().logW("Unable to tagSocket(): " + e);
           continue;
@@ -213,13 +213,17 @@ public class ConnectionPool {
    *
    * <p>It is an error to use {@code connection} after calling this method.
    */
-  public void recycle(Connection connection) {
+  void recycle(Connection connection) {
     if (connection.isSpdy()) {
       return;
     }
 
+    if (!connection.clearOwner()) {
+      return; // This connection isn't eligible for reuse.
+    }
+
     if (!connection.isAlive()) {
-      Util.closeQuietly(connection);
+      Util.closeQuietly(connection.getSocket());
       return;
     }
 
@@ -228,7 +232,7 @@ public class ConnectionPool {
     } catch (SocketException e) {
       // When unable to remove tagging, skip recycling and close.
       Platform.get().logW("Unable to untagSocket(): " + e);
-      Util.closeQuietly(connection);
+      Util.closeQuietly(connection.getSocket());
       return;
     }
 
@@ -245,7 +249,7 @@ public class ConnectionPool {
    * Shares the SPDY connection with the pool. Callers to this method may
    * continue to use {@code connection}.
    */
-  public void share(Connection connection) {
+  void share(Connection connection) {
     if (!connection.isSpdy()) throw new IllegalArgumentException();
     executorService.execute(connectionsCleanupRunnable);
     if (connection.isAlive()) {
@@ -259,12 +263,12 @@ public class ConnectionPool {
   public void evictAll() {
     List<Connection> connections;
     synchronized (this) {
-      connections = new ArrayList<Connection>(this.connections);
+      connections = new ArrayList<>(this.connections);
       this.connections.clear();
     }
 
     for (int i = 0, size = connections.size(); i < size; i++) {
-      Util.closeQuietly(connections.get(i));
+      Util.closeQuietly(connections.get(i).getSocket());
     }
   }
 }

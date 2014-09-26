@@ -15,36 +15,45 @@
  */
 package com.squareup.okhttp.internal;
 
-import com.squareup.okhttp.OkAuthenticator;
-import java.io.IOException;
+import com.squareup.okhttp.Authenticator;
+import com.squareup.okhttp.Request;
+import com.squareup.okhttp.Response;
 import java.net.Proxy;
-import java.net.URL;
 import java.util.ArrayList;
 import java.util.List;
 
-public final class RecordingOkAuthenticator implements OkAuthenticator {
-  public final List<String> calls = new ArrayList<String>();
-  public final Credential credential;
+public final class RecordingOkAuthenticator implements Authenticator {
+  public final List<Response> responses = new ArrayList<>();
+  public final List<Proxy> proxies = new ArrayList<>();
+  public final String credential;
 
-  public RecordingOkAuthenticator(Credential credential) {
+  public RecordingOkAuthenticator(String credential) {
     this.credential = credential;
   }
 
-  @Override public Credential authenticate(Proxy proxy, URL url, List<Challenge> challenges)
-      throws IOException {
-    calls.add("authenticate"
-        + " proxy=" + proxy.type()
-        + " url=" + url
-        + " challenges=" + challenges);
-    return credential;
+  public Response onlyResponse() {
+    if (responses.size() != 1) throw new IllegalStateException();
+    return responses.get(0);
   }
 
-  @Override public Credential authenticateProxy(Proxy proxy, URL url, List<Challenge> challenges)
-      throws IOException {
-    calls.add("authenticateProxy"
-        + " proxy=" + proxy.type()
-        + " url=" + url
-        + " challenges=" + challenges);
-    return credential;
+  public Proxy onlyProxy() {
+    if (proxies.size() != 1) throw new IllegalStateException();
+    return proxies.get(0);
+  }
+
+  @Override public Request authenticate(Proxy proxy, Response response) {
+    responses.add(response);
+    proxies.add(proxy);
+    return response.request().newBuilder()
+        .addHeader("Authorization", credential)
+        .build();
+  }
+
+  @Override public Request authenticateProxy(Proxy proxy, Response response) {
+    responses.add(response);
+    proxies.add(proxy);
+    return response.request().newBuilder()
+        .addHeader("Proxy-Authorization", credential)
+        .build();
   }
 }

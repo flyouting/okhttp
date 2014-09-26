@@ -21,6 +21,7 @@ import com.squareup.okhttp.internal.Util;
 import java.io.Closeable;
 import java.io.IOException;
 import java.io.InterruptedIOException;
+import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.util.HashMap;
 import java.util.Iterator;
@@ -29,14 +30,16 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ExecutorService;
+import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.SynchronousQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
-import okio.BufferedSink;
+import okio.Buffer;
 import okio.BufferedSource;
 import okio.ByteString;
-import okio.OkBuffer;
 import okio.Okio;
+
+import static com.squareup.okhttp.internal.spdy.Settings.DEFAULT_INITIAL_WINDOW_SIZE;
 
 /**
  * A socket connection to a remote peer. A connection hosts streams which can
@@ -76,20 +79,21 @@ public final class SpdyConnection implements Closeable {
    * run on the callback executor.
    */
   private final IncomingStreamHandler handler;
-  private final Map<Integer, SpdyStream> streams = new HashMap<Integer, SpdyStream>();
+  private final Map<Integer, SpdyStream> streams = new HashMap<>();
   private final String hostName;
   private int lastGoodStreamId;
   private int nextStreamId;
   private boolean shutdown;
   private long idleStartTimeNs = System.nanoTime();
 
+  /** Ensures push promise callbacks events are sent in order per stream. */
+  private final ExecutorService pushExecutor;
+
   /** Lazily-created map of in-flight pings awaiting a response. Guarded by this. */
   private Map<Integer, Ping> pings;
   /** User code to run in response to push promise events. */
   private final PushObserver pushObserver;
   private int nextPingId;
-
-  static final int INITIAL_WINDOW_SIZE = 65535;
 
   /**
    * The total number of bytes consumed by the application, but not yet
@@ -107,30 +111,33 @@ public final class SpdyConnection implements Closeable {
 
   /** Settings we communicate to the peer. */
   // TODO: Do we want to dynamically adjust settings, or KISS and only set once?
-  final Settings okHttpSettings = new Settings()
-      .set(Settings.INITIAL_WINDOW_SIZE, 0, INITIAL_WINDOW_SIZE);
-      // TODO: implement stream limit
+  final Settings okHttpSettings = new Settings();
       // okHttpSettings.set(Settings.MAX_CONCURRENT_STREAMS, 0, max);
+  private static final int OKHTTP_CLIENT_WINDOW_SIZE = 16 * 1024 * 1024;
 
   /** Settings we receive from the peer. */
   // TODO: MWS will need to guard on this setting before attempting to push.
-  final Settings peerSettings = new Settings()
-      .set(Settings.INITIAL_WINDOW_SIZE, 0, INITIAL_WINDOW_SIZE);
+  final Settings peerSettings = new Settings();
 
   private boolean receivedInitialPeerSettings = false;
-  final FrameReader frameReader;
+  final Variant variant;
+  final Socket socket;
   final FrameWriter frameWriter;
-  final long maxFrameSize;
 
   // Visible for testing
   final Reader readerRunnable;
 
-  private SpdyConnection(Builder builder) {
+  private SpdyConnection(Builder builder) throws IOException {
     protocol = builder.protocol;
     pushObserver = builder.pushObserver;
     client = builder.client;
     handler = builder.handler;
+    // http://tools.ietf.org/html/draft-ietf-httpbis-http2-14#section-5.1.1
     nextStreamId = builder.client ? 1 : 2;
+    if (builder.client && protocol == Protocol.HTTP_2) {
+      nextStreamId += 2; // In HTTP/2, 1 on client is reserved for Upgrade.
+    }
+
     nextPingId = builder.client ? 1 : 2;
 
     // Flow control was designed more for servers, or proxies than edge clients.
@@ -138,23 +145,30 @@ public final class SpdyConnection implements Closeable {
     // thrashing window updates every 64KiB, yet small enough to avoid blowing
     // up the heap.
     if (builder.client) {
-      okHttpSettings.set(Settings.INITIAL_WINDOW_SIZE, 0, 16 * 1024 * 1024);
+      okHttpSettings.set(Settings.INITIAL_WINDOW_SIZE, 0, OKHTTP_CLIENT_WINDOW_SIZE);
     }
 
     hostName = builder.hostName;
 
-    Variant variant;
     if (protocol == Protocol.HTTP_2) {
-      variant = new Http20Draft09();
+      variant = new Http20Draft14();
+      // Like newSingleThreadExecutor, except lazy creates the thread.
+      pushExecutor = new ThreadPoolExecutor(0, 1,
+          0L, TimeUnit.MILLISECONDS,
+          new LinkedBlockingQueue<Runnable>(),
+          Util.threadFactory(String.format("OkHttp %s Push Observer", hostName), true));
+      // 1 less than SPDY http://tools.ietf.org/html/draft-ietf-httpbis-http2-14#section-6.9.2
+      peerSettings.set(Settings.INITIAL_WINDOW_SIZE, 0, 65535);
+      peerSettings.set(Settings.MAX_FRAME_SIZE, 0, Http20Draft14.INITIAL_MAX_FRAME_SIZE);
     } else if (protocol == Protocol.SPDY_3) {
       variant = new Spdy3();
+      pushExecutor = null;
     } else {
       throw new AssertionError(protocol);
     }
-    bytesLeftInWriteWindow = peerSettings.getInitialWindowSize();
-    frameReader = variant.newReader(builder.source, client);
-    frameWriter = variant.newWriter(builder.sink, client);
-    maxFrameSize = variant.maxFrameSize();
+    bytesLeftInWriteWindow = peerSettings.getInitialWindowSize(DEFAULT_INITIAL_WINDOW_SIZE);
+    socket = builder.socket;
+    frameWriter = variant.newWriter(Okio.buffer(Okio.sink(builder.socket)), client);
 
     readerRunnable = new Reader();
     new Thread(readerRunnable).start(); // Not a daemon thread.
@@ -234,8 +248,6 @@ public final class SpdyConnection implements Closeable {
       boolean in) throws IOException {
     boolean outFinished = !out;
     boolean inFinished = !in;
-    int priority = -1; // TODO: permit the caller to specify a priority?
-    int slot = 0; // TODO: permit the caller to specify a slot?
     SpdyStream stream;
     int streamId;
 
@@ -246,14 +258,14 @@ public final class SpdyConnection implements Closeable {
         }
         streamId = nextStreamId;
         nextStreamId += 2;
-        stream = new SpdyStream(streamId, this, outFinished, inFinished, priority, requestHeaders);
+        stream = new SpdyStream(streamId, this, outFinished, inFinished, requestHeaders);
         if (stream.isOpen()) {
           streams.put(streamId, stream);
           setIdle(false);
         }
       }
       if (associatedStreamId == 0) {
-        frameWriter.synStream(outFinished, inFinished, streamId, associatedStreamId, priority, slot,
+        frameWriter.synStream(outFinished, inFinished, streamId, associatedStreamId,
             requestHeaders);
       } else if (client) {
         throw new IllegalArgumentException("client streams shouldn't have associated stream IDs");
@@ -289,7 +301,7 @@ public final class SpdyConnection implements Closeable {
    * will not block.  The only use case for zero {@code byteCount} is closing
    * a flushed output stream.
    */
-  public void writeData(int streamId, boolean outFinished, OkBuffer buffer, long byteCount)
+  public void writeData(int streamId, boolean outFinished, Buffer buffer, long byteCount)
       throws IOException {
     if (byteCount == 0) { // Empty data frames are not flow-controlled.
       frameWriter.data(outFinished, streamId, buffer, 0);
@@ -307,7 +319,8 @@ public final class SpdyConnection implements Closeable {
           throw new InterruptedIOException();
         }
 
-        toWrite = (int) Math.min(Math.min(byteCount, bytesLeftInWriteWindow), maxFrameSize);
+        toWrite = (int) Math.min(byteCount, bytesLeftInWriteWindow);
+        toWrite = Math.min(toWrite, frameWriter.maxDataLength());
         bytesLeftInWriteWindow -= toWrite;
       }
 
@@ -364,7 +377,7 @@ public final class SpdyConnection implements Closeable {
       }
       pingId = nextPingId;
       nextPingId += 2;
-      if (pings == null) pings = new HashMap<Integer, Ping>();
+      if (pings == null) pings = new HashMap<>();
       pings.put(pingId, ping);
     }
     writePing(false, pingId, 0x4f4b6f6b /* ASCII "OKok" */, ping);
@@ -469,15 +482,18 @@ public final class SpdyConnection implements Closeable {
       }
     }
 
-    try {
-      frameReader.close();
-    } catch (IOException e) {
-      thrown = e;
-    }
+    // Close the writer to release its resources (such as deflaters).
     try {
       frameWriter.close();
     } catch (IOException e) {
       if (thrown == null) thrown = e;
+    }
+
+    // Close the socket to break out the reader thread, which will clean up after itself.
+    try {
+      socket.close();
+    } catch (IOException e) {
+      thrown = e;
     }
 
     if (thrown != null) throw thrown;
@@ -487,34 +503,35 @@ public final class SpdyConnection implements Closeable {
    * Sends a connection header if the current variant requires it. This should
    * be called after {@link Builder#build} for all new connections.
    */
-  public void sendConnectionHeader() throws IOException {
-    frameWriter.connectionHeader();
+  public void sendConnectionPreface() throws IOException {
+    frameWriter.connectionPreface();
     frameWriter.settings(okHttpSettings);
+    int windowSize = okHttpSettings.getInitialWindowSize(Settings.DEFAULT_INITIAL_WINDOW_SIZE);
+    if (windowSize != Settings.DEFAULT_INITIAL_WINDOW_SIZE) {
+      frameWriter.windowUpdate(0, windowSize - Settings.DEFAULT_INITIAL_WINDOW_SIZE);
+    }
   }
 
   public static class Builder {
     private String hostName;
-    private BufferedSource source;
-    private BufferedSink sink;
+    private Socket socket;
     private IncomingStreamHandler handler = IncomingStreamHandler.REFUSE_INCOMING_STREAMS;
     private Protocol protocol = Protocol.SPDY_3;
     private PushObserver pushObserver = PushObserver.CANCEL;
     private boolean client;
 
     public Builder(boolean client, Socket socket) throws IOException {
-      this("", client, Okio.buffer(Okio.source(socket.getInputStream())),
-          Okio.buffer(Okio.sink(socket.getOutputStream())));
+      this(((InetSocketAddress) socket.getRemoteSocketAddress()).getHostName(), client, socket);
     }
 
     /**
      * @param client true if this peer initiated the connection; false if this
      *     peer accepted the connection.
      */
-    public Builder(String hostName, boolean client, BufferedSource source, BufferedSink sink) {
+    public Builder(String hostName, boolean client, Socket socket) throws IOException {
       this.hostName = hostName;
       this.client = client;
-      this.source = source;
-      this.sink = sink;
+      this.socket = socket;
     }
 
     public Builder handler(IncomingStreamHandler handler) {
@@ -532,7 +549,7 @@ public final class SpdyConnection implements Closeable {
       return this;
     }
 
-    public SpdyConnection build() {
+    public SpdyConnection build() throws IOException {
       return new SpdyConnection(this);
     }
   }
@@ -542,6 +559,8 @@ public final class SpdyConnection implements Closeable {
    * write a frame, create an async task to do so.
    */
   class Reader extends NamedRunnable implements FrameReader.Handler {
+    FrameReader frameReader;
+
     private Reader() {
       super("OkHttp %s", hostName);
     }
@@ -550,8 +569,9 @@ public final class SpdyConnection implements Closeable {
       ErrorCode connectionErrorCode = ErrorCode.INTERNAL_ERROR;
       ErrorCode streamErrorCode = ErrorCode.INTERNAL_ERROR;
       try {
+        frameReader = variant.newReader(Okio.buffer(Okio.source(socket)), client);
         if (!client) {
-          frameReader.readConnectionHeader();
+          frameReader.readConnectionPreface();
         }
         while (frameReader.nextFrame(this)) {
         }
@@ -565,6 +585,7 @@ public final class SpdyConnection implements Closeable {
           close(connectionErrorCode, streamErrorCode);
         } catch (IOException ignored) {
         }
+        Util.closeQuietly(frameReader);
       }
     }
 
@@ -587,7 +608,7 @@ public final class SpdyConnection implements Closeable {
     }
 
     @Override public void headers(boolean outFinished, boolean inFinished, int streamId,
-        int associatedStreamId, int priority, List<Header> headerBlock, HeadersMode headersMode) {
+        int associatedStreamId, List<Header> headerBlock, HeadersMode headersMode) {
       if (pushedStream(streamId)) {
         pushHeadersLater(streamId, headerBlock, inFinished);
         return;
@@ -614,7 +635,7 @@ public final class SpdyConnection implements Closeable {
 
           // Create a stream.
           final SpdyStream newStream = new SpdyStream(streamId, SpdyConnection.this, outFinished,
-              inFinished, priority, headerBlock);
+              inFinished, headerBlock);
           lastGoodStreamId = streamId;
           streams.put(streamId, newStream);
           executor.submit(new NamedRunnable("OkHttp %s stream %d", hostName, streamId) {
@@ -657,16 +678,13 @@ public final class SpdyConnection implements Closeable {
       long delta = 0;
       SpdyStream[] streamsToNotify = null;
       synchronized (SpdyConnection.this) {
-        int priorWriteWindowSize = peerSettings.getInitialWindowSize();
-        if (clearPrevious) {
-          peerSettings.clear();
-        } else {
-          peerSettings.merge(newSettings);
-        }
+        int priorWriteWindowSize = peerSettings.getInitialWindowSize(DEFAULT_INITIAL_WINDOW_SIZE);
+        if (clearPrevious) peerSettings.clear();
+        peerSettings.merge(newSettings);
         if (getProtocol() == Protocol.HTTP_2) {
-          ackSettingsLater();
+          ackSettingsLater(newSettings);
         }
-        int peerInitialWindowSize = peerSettings.getInitialWindowSize();
+        int peerInitialWindowSize = peerSettings.getInitialWindowSize(DEFAULT_INITIAL_WINDOW_SIZE);
         if (peerInitialWindowSize != -1 && peerInitialWindowSize != priorWriteWindowSize) {
           delta = peerInitialWindowSize - priorWriteWindowSize;
           if (!receivedInitialPeerSettings) {
@@ -687,11 +705,11 @@ public final class SpdyConnection implements Closeable {
       }
     }
 
-    private void ackSettingsLater() {
+    private void ackSettingsLater(final Settings peerSettings) {
       executor.submit(new NamedRunnable("OkHttp %s ACK Settings", hostName) {
         @Override public void execute() {
           try {
-            frameWriter.ackSettings();
+            frameWriter.ackSettings(peerSettings);
           } catch (IOException ignored) {
           }
         }
@@ -749,13 +767,19 @@ public final class SpdyConnection implements Closeable {
       }
     }
 
-    @Override public void priority(int streamId, int priority) {
+    @Override public void priority(int streamId, int streamDependency, int weight,
+        boolean exclusive) {
       // TODO: honor priority.
     }
 
     @Override
     public void pushPromise(int streamId, int promisedStreamId, List<Header> requestHeaders) {
       pushRequestLater(promisedStreamId, requestHeaders);
+    }
+
+    @Override public void alternateService(int streamId, String origin, ByteString protocol,
+        String host, int port, long maxAge) {
+      // TODO: register alternate service.
     }
   }
 
@@ -765,7 +789,7 @@ public final class SpdyConnection implements Closeable {
   }
 
   // Guarded by this.
-  private final Set<Integer> currentPushRequests = new LinkedHashSet<Integer>();
+  private final Set<Integer> currentPushRequests = new LinkedHashSet<>();
 
   private void pushRequestLater(final int streamId, final List<Header> requestHeaders) {
     synchronized (this) {
@@ -775,7 +799,7 @@ public final class SpdyConnection implements Closeable {
       }
       currentPushRequests.add(streamId);
     }
-    executor.submit(new NamedRunnable("OkHttp %s Push Request[%s]", hostName, streamId) {
+    pushExecutor.submit(new NamedRunnable("OkHttp %s Push Request[%s]", hostName, streamId) {
       @Override public void execute() {
         boolean cancel = pushObserver.onRequest(streamId, requestHeaders);
         try {
@@ -793,7 +817,7 @@ public final class SpdyConnection implements Closeable {
 
   private void pushHeadersLater(final int streamId, final List<Header> requestHeaders,
       final boolean inFinished) {
-    executor.submit(new NamedRunnable("OkHttp %s Push Headers[%s]", hostName, streamId) {
+    pushExecutor.submit(new NamedRunnable("OkHttp %s Push Headers[%s]", hostName, streamId) {
       @Override public void execute() {
         boolean cancel = pushObserver.onHeaders(streamId, requestHeaders, inFinished);
         try {
@@ -815,11 +839,11 @@ public final class SpdyConnection implements Closeable {
    */
   private void pushDataLater(final int streamId, final BufferedSource source, final int byteCount,
       final boolean inFinished) throws IOException {
-    final OkBuffer buffer = new OkBuffer();
+    final Buffer buffer = new Buffer();
     source.require(byteCount); // Eagerly read the frame before firing client thread.
     source.read(buffer, byteCount);
     if (buffer.size() != byteCount) throw new IOException(buffer.size() + " != " + byteCount);
-    executor.submit(new NamedRunnable("OkHttp %s Push Data[%s]", hostName, streamId) {
+    pushExecutor.submit(new NamedRunnable("OkHttp %s Push Data[%s]", hostName, streamId) {
       @Override public void execute() {
         try {
           boolean cancel = pushObserver.onData(streamId, buffer, byteCount, inFinished);
@@ -836,7 +860,7 @@ public final class SpdyConnection implements Closeable {
   }
 
   private void pushResetLater(final int streamId, final ErrorCode errorCode) {
-    executor.submit(new NamedRunnable("OkHttp %s Push Reset[%s]", hostName, streamId) {
+    pushExecutor.submit(new NamedRunnable("OkHttp %s Push Reset[%s]", hostName, streamId) {
       @Override public void execute() {
         pushObserver.onReset(streamId, errorCode);
         synchronized (SpdyConnection.this) {

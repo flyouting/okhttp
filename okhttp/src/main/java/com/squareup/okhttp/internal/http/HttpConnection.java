@@ -19,21 +19,21 @@ package com.squareup.okhttp.internal.http;
 import com.squareup.okhttp.Connection;
 import com.squareup.okhttp.ConnectionPool;
 import com.squareup.okhttp.Headers;
-import com.squareup.okhttp.Protocol;
 import com.squareup.okhttp.Response;
+import com.squareup.okhttp.internal.Internal;
 import com.squareup.okhttp.internal.Util;
 import java.io.IOException;
-import java.io.OutputStream;
-import java.net.CacheRequest;
 import java.net.ProtocolException;
 import java.net.Socket;
+import java.net.SocketTimeoutException;
+import java.util.concurrent.TimeUnit;
+import okio.Buffer;
 import okio.BufferedSink;
 import okio.BufferedSource;
-import okio.Deadline;
-import okio.OkBuffer;
 import okio.Okio;
 import okio.Sink;
 import okio.Source;
+import okio.Timeout;
 
 import static com.squareup.okhttp.internal.Util.checkOffsetAndCount;
 import static com.squareup.okhttp.internal.http.StatusLine.HTTP_CONTINUE;
@@ -72,18 +72,29 @@ public final class HttpConnection {
 
   private final ConnectionPool pool;
   private final Connection connection;
+  private final Socket socket;
   private final BufferedSource source;
   private final BufferedSink sink;
 
   private int state = STATE_IDLE;
   private int onIdle = ON_IDLE_HOLD;
 
-  public HttpConnection(ConnectionPool pool, Connection connection, BufferedSource source,
-      BufferedSink sink) {
+  public HttpConnection(ConnectionPool pool, Connection connection, Socket socket)
+      throws IOException {
     this.pool = pool;
     this.connection = connection;
-    this.source = source;
-    this.sink = sink;
+    this.socket = socket;
+    this.source = Okio.buffer(Okio.source(socket));
+    this.sink = Okio.buffer(Okio.sink(socket));
+  }
+
+  public void setTimeouts(int readTimeoutMillis, int writeTimeoutMillis) {
+    if (readTimeoutMillis != 0) {
+      source.timeout().timeout(readTimeoutMillis, TimeUnit.MILLISECONDS);
+    }
+    if (writeTimeoutMillis != 0) {
+      sink.timeout().timeout(writeTimeoutMillis, TimeUnit.MILLISECONDS);
+    }
   }
 
   /**
@@ -96,7 +107,7 @@ public final class HttpConnection {
     // If we're already idle, go to the pool immediately.
     if (state == STATE_IDLE) {
       onIdle = ON_IDLE_HOLD; // Set the on idle policy back to the default.
-      pool.recycle(connection);
+      Internal.instance.recycle(pool, connection);
     }
   }
 
@@ -110,7 +121,7 @@ public final class HttpConnection {
     // If we're already idle, close immediately.
     if (state == STATE_IDLE) {
       state = STATE_CLOSED;
-      connection.close();
+      connection.getSocket().close();
     }
   }
 
@@ -119,8 +130,37 @@ public final class HttpConnection {
     return state == STATE_CLOSED;
   }
 
+  public void closeIfOwnedBy(Object owner) throws IOException {
+    Internal.instance.closeIfOwnedBy(connection, owner);
+  }
+
   public void flush() throws IOException {
     sink.flush();
+  }
+
+  /** Returns the number of buffered bytes immediately readable. */
+  public long bufferSize() {
+    return source.buffer().size();
+  }
+
+  /** Test for a stale socket. */
+  public boolean isReadable() {
+    try {
+      int readTimeout = socket.getSoTimeout();
+      try {
+        socket.setSoTimeout(1);
+        if (source.exhausted()) {
+          return false; // Stream is exhausted; socket is closed.
+        }
+        return true;
+      } finally {
+        socket.setSoTimeout(readTimeout);
+      }
+    } catch (SocketTimeoutException ignored) {
+      return true; // Read timed out; socket is good.
+    } catch (IOException e) {
+      return false; // Couldn't read; socket is closed.
+    }
   }
 
   /** Returns bytes of a request header for sending on an HTTP transport. */
@@ -144,18 +184,19 @@ public final class HttpConnection {
     }
 
     while (true) {
-      String statusLineString = source.readUtf8LineStrict();
-      StatusLine statusLine = new StatusLine(statusLineString);
+      StatusLine statusLine = StatusLine.parse(source.readUtf8LineStrict());
 
       Response.Builder responseBuilder = new Response.Builder()
-          .statusLine(statusLine)
-          .header(OkHeaders.SELECTED_PROTOCOL, Protocol.HTTP_11.name.utf8());
+          .protocol(statusLine.protocol)
+          .code(statusLine.code)
+          .message(statusLine.message);
 
       Headers.Builder headersBuilder = new Headers.Builder();
       readHeaders(headersBuilder);
+      headersBuilder.add(OkHeaders.SELECTED_PROTOCOL, statusLine.protocol.toString());
       responseBuilder.headers(headersBuilder.build());
 
-      if (statusLine.code() != HTTP_CONTINUE) {
+      if (statusLine.code != HTTP_CONTINUE) {
         state = STATE_OPEN_RESPONSE_BODY;
         return responseBuilder;
       }
@@ -166,7 +207,7 @@ public final class HttpConnection {
   public void readHeaders(Headers.Builder builder) throws IOException {
     // parse the result headers until the first blank line
     for (String line; (line = source.readUtf8LineStrict()).length() != 0; ) {
-      builder.addLine(line);
+      Internal.instance.addLine(builder, line);
     }
   }
 
@@ -177,7 +218,6 @@ public final class HttpConnection {
    * that may never occur.
    */
   public boolean discard(Source in, int timeoutMillis) {
-    Socket socket = connection.getSocket();
     try {
       int socketTimeout = socket.getSoTimeout();
       socket.setSoTimeout(timeoutMillis);
@@ -246,11 +286,11 @@ public final class HttpConnection {
       this.bytesRemaining = bytesRemaining;
     }
 
-    @Override public Sink deadline(Deadline deadline) {
-      return this; // TODO: honor deadline.
+    @Override public Timeout timeout() {
+      return sink.timeout();
     }
 
-    @Override public void write(OkBuffer source, long byteCount) throws IOException {
+    @Override public void write(Buffer source, long byteCount) throws IOException {
       if (closed) throw new IllegalStateException("closed");
       checkOffsetAndCount(source.size(), 0, byteCount);
       if (byteCount > bytesRemaining) {
@@ -291,11 +331,11 @@ public final class HttpConnection {
 
     private boolean closed;
 
-    @Override public Sink deadline(Deadline deadline) {
-      return this; // TODO: honor deadline.
+    @Override public Timeout timeout() {
+      return sink.timeout();
     }
 
-    @Override public void write(OkBuffer source, long byteCount) throws IOException {
+    @Override public void write(Buffer source, long byteCount) throws IOException {
       if (closed) throw new IllegalStateException("closed");
       if (byteCount == 0) return;
 
@@ -331,12 +371,12 @@ public final class HttpConnection {
 
   private class AbstractSource {
     private final CacheRequest cacheRequest;
-    protected final OutputStream cacheBody;
+    protected final Sink cacheBody;
     protected boolean closed;
 
     AbstractSource(CacheRequest cacheRequest) throws IOException {
       // Some apps return a null body; for compatibility we treat that like a null cache request.
-      OutputStream cacheBody = cacheRequest != null ? cacheRequest.getBody() : null;
+      Sink cacheBody = cacheRequest != null ? cacheRequest.body() : null;
       if (cacheBody == null) {
         cacheRequest = null;
       }
@@ -346,9 +386,10 @@ public final class HttpConnection {
     }
 
     /** Copy the last {@code byteCount} bytes of {@code source} to the cache body. */
-    protected final void cacheWrite(OkBuffer source, long byteCount) throws IOException {
+    protected final void cacheWrite(Buffer source, long byteCount) throws IOException {
       if (cacheBody != null) {
-        Okio.copy(source, source.size() - byteCount, byteCount, cacheBody);
+        // TODO source.copyTo(cacheBody, byteCount);
+        cacheBody.write(source.clone(), byteCount);
       }
     }
 
@@ -356,7 +397,7 @@ public final class HttpConnection {
      * Closes the cache entry and makes the socket available for reuse. This
      * should be invoked when the end of the body has been reached.
      */
-    protected final void endOfInput() throws IOException {
+    protected final void endOfInput(boolean recyclable) throws IOException {
       if (state != STATE_READING_RESPONSE_BODY) throw new IllegalStateException("state: " + state);
 
       if (cacheRequest != null) {
@@ -364,12 +405,12 @@ public final class HttpConnection {
       }
 
       state = STATE_IDLE;
-      if (onIdle == ON_IDLE_POOL) {
+      if (recyclable && onIdle == ON_IDLE_POOL) {
         onIdle = ON_IDLE_HOLD; // Set the on idle policy back to the default.
-        pool.recycle(connection);
+        Internal.instance.recycle(pool, connection);
       } else if (onIdle == ON_IDLE_CLOSE) {
         state = STATE_CLOSED;
-        connection.close();
+        connection.getSocket().close();
       }
     }
 
@@ -389,7 +430,7 @@ public final class HttpConnection {
       if (cacheRequest != null) {
         cacheRequest.abort();
       }
-      Util.closeQuietly(connection);
+      Util.closeQuietly(connection.getSocket());
       state = STATE_CLOSED;
     }
   }
@@ -402,11 +443,11 @@ public final class HttpConnection {
       super(cacheRequest);
       bytesRemaining = length;
       if (bytesRemaining == 0) {
-        endOfInput();
+        endOfInput(true);
       }
     }
 
-    @Override public long read(OkBuffer sink, long byteCount)
+    @Override public long read(Buffer sink, long byteCount)
         throws IOException {
       if (byteCount < 0) throw new IllegalArgumentException("byteCount < 0: " + byteCount);
       if (closed) throw new IllegalStateException("closed");
@@ -421,14 +462,13 @@ public final class HttpConnection {
       bytesRemaining -= read;
       cacheWrite(sink, read);
       if (bytesRemaining == 0) {
-        endOfInput();
+        endOfInput(true);
       }
       return read;
     }
 
-    @Override public Source deadline(Deadline deadline) {
-      source.deadline(deadline);
-      return this;
+    @Override public Timeout timeout() {
+      return source.timeout();
     }
 
     @Override public void close() throws IOException {
@@ -455,7 +495,7 @@ public final class HttpConnection {
     }
 
     @Override public long read(
-        OkBuffer sink, long byteCount) throws IOException {
+        Buffer sink, long byteCount) throws IOException {
       if (byteCount < 0) throw new IllegalArgumentException("byteCount < 0: " + byteCount);
       if (closed) throw new IllegalStateException("closed");
       if (!hasMoreChunks) return -1;
@@ -495,13 +535,12 @@ public final class HttpConnection {
         Headers.Builder trailersBuilder = new Headers.Builder();
         readHeaders(trailersBuilder);
         httpEngine.receiveHeaders(trailersBuilder.build());
-        endOfInput();
+        endOfInput(true);
       }
     }
 
-    @Override public Source deadline(Deadline deadline) {
-      source.deadline(deadline);
-      return this;
+    @Override public Timeout timeout() {
+      return source.timeout();
     }
 
     @Override public void close() throws IOException {
@@ -521,7 +560,7 @@ public final class HttpConnection {
       super(cacheRequest);
     }
 
-    @Override public long read(OkBuffer sink, long byteCount)
+    @Override public long read(Buffer sink, long byteCount)
         throws IOException {
       if (byteCount < 0) throw new IllegalArgumentException("byteCount < 0: " + byteCount);
       if (closed) throw new IllegalStateException("closed");
@@ -530,16 +569,15 @@ public final class HttpConnection {
       long read = source.read(sink, byteCount);
       if (read == -1) {
         inputExhausted = true;
-        endOfInput();
+        endOfInput(false);
         return -1;
       }
       cacheWrite(sink, read);
       return read;
     }
 
-    @Override public Source deadline(Deadline deadline) {
-      source.deadline(deadline);
-      return this;
+    @Override public Timeout timeout() {
+      return source.timeout();
     }
 
     @Override public void close() throws IOException {

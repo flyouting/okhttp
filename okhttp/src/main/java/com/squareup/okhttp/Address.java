@@ -17,8 +17,8 @@ package com.squareup.okhttp;
 
 import com.squareup.okhttp.internal.Util;
 import java.net.Proxy;
-import java.net.UnknownHostException;
 import java.util.List;
+import javax.net.SocketFactory;
 import javax.net.ssl.HostnameVerifier;
 import javax.net.ssl.SSLSocketFactory;
 
@@ -27,7 +27,7 @@ import static com.squareup.okhttp.internal.Util.equal;
 /**
  * A specification for a connection to an origin server. For simple connections,
  * this is the server's hostname and port. If an explicit proxy is requested (or
- * {@link Proxy#NO_PROXY no proxy} is explicitly requested), this also includes
+ * {@linkplain Proxy#NO_PROXY no proxy} is explicitly requested), this also includes
  * that proxy information. For secure connections the address also includes the
  * SSL socket factory and hostname verifier.
  *
@@ -38,14 +38,15 @@ public final class Address {
   final Proxy proxy;
   final String uriHost;
   final int uriPort;
+  final SocketFactory socketFactory;
   final SSLSocketFactory sslSocketFactory;
   final HostnameVerifier hostnameVerifier;
-  final OkAuthenticator authenticator;
+  final Authenticator authenticator;
   final List<Protocol> protocols;
 
-  public Address(String uriHost, int uriPort, SSLSocketFactory sslSocketFactory,
-      HostnameVerifier hostnameVerifier, OkAuthenticator authenticator, Proxy proxy,
-      List<Protocol> protocols) throws UnknownHostException {
+  public Address(String uriHost, int uriPort, SocketFactory socketFactory,
+      SSLSocketFactory sslSocketFactory, HostnameVerifier hostnameVerifier,
+      Authenticator authenticator, Proxy proxy, List<Protocol> protocols) {
     if (uriHost == null) throw new NullPointerException("uriHost == null");
     if (uriPort <= 0) throw new IllegalArgumentException("uriPort <= 0: " + uriPort);
     if (authenticator == null) throw new IllegalArgumentException("authenticator == null");
@@ -53,6 +54,7 @@ public final class Address {
     this.proxy = proxy;
     this.uriHost = uriHost;
     this.uriPort = uriPort;
+    this.socketFactory = socketFactory;
     this.sslSocketFactory = sslSocketFactory;
     this.hostnameVerifier = hostnameVerifier;
     this.authenticator = authenticator;
@@ -72,6 +74,11 @@ public final class Address {
     return uriPort;
   }
 
+  /** Returns the socket factory for new connections. */
+  public SocketFactory getSocketFactory() {
+    return socketFactory;
+  }
+
   /**
    * Returns the SSL socket factory, or null if this is not an HTTPS
    * address.
@@ -88,18 +95,16 @@ public final class Address {
     return hostnameVerifier;
   }
 
-
   /**
    * Returns the client's authenticator. This method never returns null.
    */
-  public OkAuthenticator getAuthenticator() {
+  public Authenticator getAuthenticator() {
     return authenticator;
   }
 
   /**
    * Returns the protocols the client supports. This method always returns a
-   * non-null list that contains minimally
-   * {@link Protocol#HTTP_11}.
+   * non-null list that contains minimally {@link Protocol#HTTP_1_1}.
    */
   public List<Protocol> getProtocols() {
     return protocols;
@@ -133,7 +138,7 @@ public final class Address {
     result = 31 * result + uriPort;
     result = 31 * result + (sslSocketFactory != null ? sslSocketFactory.hashCode() : 0);
     result = 31 * result + (hostnameVerifier != null ? hostnameVerifier.hashCode() : 0);
-    result = 31 * result + (authenticator != null ? authenticator.hashCode() : 0);
+    result = 31 * result + authenticator.hashCode();
     result = 31 * result + (proxy != null ? proxy.hashCode() : 0);
     result = 31 * result + protocols.hashCode();
     return result;

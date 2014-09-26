@@ -19,7 +19,6 @@ package com.squareup.okhttp.internal.http;
 import com.squareup.okhttp.Request;
 import com.squareup.okhttp.Response;
 import java.io.IOException;
-import java.net.CacheRequest;
 import okio.Sink;
 import okio.Source;
 
@@ -93,8 +92,8 @@ public final class HttpTransport implements Transport {
     httpEngine.writingRequestHeaders();
     String requestLine = RequestLine.get(request,
         httpEngine.getConnection().getRoute().getProxy().type(),
-        httpEngine.getConnection().getHttpMinorVersion());
-    httpConnection.writeRequest(request.getHeaders(), requestLine);
+        httpEngine.getConnection().getProtocol());
+    httpConnection.writeRequest(request.headers(), requestLine);
   }
 
   @Override public Response.Builder readResponseHeaders() throws IOException {
@@ -149,5 +148,9 @@ public final class HttpTransport implements Transport {
     // "socketIn" directly here), so that we can control its use after the
     // reference escapes.
     return httpConnection.newUnknownLengthSource(cacheRequest);
+  }
+
+  @Override public void disconnect(HttpEngine engine) throws IOException {
+    httpConnection.closeIfOwnedBy(engine);
   }
 }

@@ -18,9 +18,12 @@ package com.squareup.okhttp.internal.http;
 import com.squareup.okhttp.Address;
 import com.squareup.okhttp.Connection;
 import com.squareup.okhttp.ConnectionPool;
+import com.squareup.okhttp.HostResolver;
+import com.squareup.okhttp.OkHttpClient;
+import com.squareup.okhttp.Request;
 import com.squareup.okhttp.Route;
-import com.squareup.okhttp.RouteDatabase;
-import com.squareup.okhttp.internal.Dns;
+import com.squareup.okhttp.internal.Internal;
+import com.squareup.okhttp.internal.RouteDatabase;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
@@ -29,12 +32,14 @@ import java.net.ProxySelector;
 import java.net.SocketAddress;
 import java.net.URI;
 import java.net.UnknownHostException;
+import java.util.ArrayList;
 import java.util.Iterator;
-import java.util.LinkedList;
 import java.util.List;
 import java.util.NoSuchElementException;
+import javax.net.ssl.HostnameVerifier;
 import javax.net.ssl.SSLHandshakeException;
 import javax.net.ssl.SSLProtocolException;
+import javax.net.ssl.SSLSocketFactory;
 
 import static com.squareup.okhttp.internal.Util.getEffectivePort;
 
@@ -44,19 +49,17 @@ import static com.squareup.okhttp.internal.Util.getEffectivePort;
  * recycled.
  */
 public final class RouteSelector {
-  /** Uses {@link com.squareup.okhttp.internal.Platform#enableTlsExtensions}. */
-  private static final int TLS_MODE_MODERN = 1;
-  /** Uses {@link com.squareup.okhttp.internal.Platform#supportTlsIntolerantServer}. */
-  private static final int TLS_MODE_COMPATIBLE = 0;
-  /** No TLS mode. */
-  private static final int TLS_MODE_NULL = -1;
+  public static final String TLS_V1 = "TLSv1";
+  public static final String SSL_V3 = "SSLv3";
 
   private final Address address;
   private final URI uri;
+  private final HostResolver hostResolver;
+  private final OkHttpClient client;
   private final ProxySelector proxySelector;
   private final ConnectionPool pool;
-  private final Dns dns;
   private final RouteDatabase routeDatabase;
+  private final Request request;
 
   /* The most recently attempted route. */
   private Proxy lastProxy;
@@ -72,23 +75,43 @@ public final class RouteSelector {
   private int nextSocketAddressIndex;
   private int socketPort;
 
-  /* State for negotiating the next TLS configuration */
-  private int nextTlsMode = TLS_MODE_NULL;
+  /* TLS version to attempt with the connection. */
+  private String nextTlsVersion;
 
   /* State for negotiating failed routes */
-  private final List<Route> postponedRoutes;
+  private final List<Route> postponedRoutes = new ArrayList<>();
 
-  public RouteSelector(Address address, URI uri, ProxySelector proxySelector, ConnectionPool pool,
-      Dns dns, RouteDatabase routeDatabase) {
+  private RouteSelector(Address address, URI uri, OkHttpClient client, Request request) {
     this.address = address;
     this.uri = uri;
-    this.proxySelector = proxySelector;
-    this.pool = pool;
-    this.dns = dns;
-    this.routeDatabase = routeDatabase;
-    this.postponedRoutes = new LinkedList<Route>();
+    this.client = client;
+    this.proxySelector = client.getProxySelector();
+    this.pool = client.getConnectionPool();
+    this.routeDatabase = Internal.instance.routeDatabase(client);
+    this.hostResolver = client.getHostResolver();
+    this.request = request;
 
     resetNextProxy(uri, address.getProxy());
+  }
+
+  public static RouteSelector get(Request request, OkHttpClient client) throws IOException {
+    String uriHost = request.url().getHost();
+    if (uriHost == null || uriHost.length() == 0) {
+      throw new UnknownHostException(request.url().toString());
+    }
+
+    SSLSocketFactory sslSocketFactory = null;
+    HostnameVerifier hostnameVerifier = null;
+    if (request.isHttps()) {
+      sslSocketFactory = client.getSslSocketFactory();
+      hostnameVerifier = client.getHostnameVerifier();
+    }
+
+    Address address = new Address(uriHost, getEffectivePort(request.url()),
+        client.getSocketFactory(), sslSocketFactory, hostnameVerifier, client.getAuthenticator(),
+        client.getProxy(), client.getProtocols());
+
+    return new RouteSelector(address, request.uri(), client, request);
   }
 
   /**
@@ -96,23 +119,33 @@ public final class RouteSelector {
    * least one route.
    */
   public boolean hasNext() {
-    return hasNextTlsMode() || hasNextInetSocketAddress() || hasNextProxy() || hasNextPostponed();
+    return hasNextTlsVersion()
+        || hasNextInetSocketAddress()
+        || hasNextProxy()
+        || hasNextPostponed();
+  }
+
+  /** Selects a route to attempt and connects it if it isn't already. */
+  public Connection next(HttpEngine owner) throws IOException {
+    Connection connection = nextUnconnected();
+    Internal.instance.connectAndSetOwner(client, connection, owner, request);
+    return connection;
   }
 
   /**
-   * Returns the next route address to attempt.
+   * Returns the next connection to attempt.
    *
    * @throws NoSuchElementException if there are no more routes to attempt.
    */
-  public Connection next(String method) throws IOException {
+  Connection nextUnconnected() throws IOException {
     // Always prefer pooled connections over new connections.
     for (Connection pooled; (pooled = pool.get(address)) != null; ) {
-      if (method.equals("GET") || pooled.isReadable()) return pooled;
-      pooled.close();
+      if (request.method().equals("GET") || Internal.instance.isReadable(pooled)) return pooled;
+      pooled.getSocket().close();
     }
 
     // Compute the next route to attempt.
-    if (!hasNextTlsMode()) {
+    if (!hasNextTlsVersion()) {
       if (!hasNextInetSocketAddress()) {
         if (!hasNextProxy()) {
           if (!hasNextPostponed()) {
@@ -124,16 +157,16 @@ public final class RouteSelector {
         resetNextInetSocketAddress(lastProxy);
       }
       lastInetSocketAddress = nextInetSocketAddress();
-      resetNextTlsMode();
+      resetNextTlsVersion();
     }
 
-    boolean modernTls = nextTlsMode() == TLS_MODE_MODERN;
-    Route route = new Route(address, lastProxy, lastInetSocketAddress, modernTls);
+    String tlsVersion = nextTlsVersion();
+    Route route = new Route(address, lastProxy, lastInetSocketAddress, tlsVersion);
     if (routeDatabase.shouldPostpone(route)) {
       postponedRoutes.add(route);
       // We will only recurse in order to skip previously failed routes. They will be
       // tried last.
-      return next(method);
+      return nextUnconnected();
     }
 
     return new Connection(pool, route);
@@ -145,7 +178,7 @@ public final class RouteSelector {
    */
   public void connectFailed(Connection connection, IOException failure) {
     // If this is a recycled connection, don't count its failure against the route.
-    if (connection.recycleCount() > 0) return;
+    if (Internal.instance.recycleCount(connection) > 0) return;
 
     Route failedRoute = connection.getRoute();
     if (failedRoute.getProxy().type() != Proxy.Type.DIRECT && proxySelector != null) {
@@ -158,12 +191,11 @@ public final class RouteSelector {
     // If the previously returned route's problem was not related to TLS, and
     // the next route only changes the TLS mode, we shouldn't even attempt it.
     // This suppresses it in both this selector and also in the route database.
-    if (hasNextTlsMode()
-        && !(failure instanceof SSLHandshakeException)
-        && !(failure instanceof SSLProtocolException)) {
-      boolean modernTls = nextTlsMode() == TLS_MODE_MODERN;
-      Route routeToSuppress = new Route(address, lastProxy, lastInetSocketAddress, modernTls);
-      routeDatabase.failed(routeToSuppress);
+    if (!(failure instanceof SSLHandshakeException) && !(failure instanceof SSLProtocolException)) {
+      while (hasNextTlsVersion()) {
+        Route toSuppress = new Route(address, lastProxy, lastInetSocketAddress, nextTlsVersion());
+        routeDatabase.failed(toSuppress);
+      }
     }
   }
 
@@ -229,7 +261,7 @@ public final class RouteSelector {
     }
 
     // Try each address for best behavior in mixed IPv4/IPv6 environments.
-    socketAddresses = dns.getAllByName(socketHost);
+    socketAddresses = hostResolver.getAllByName(socketHost);
     nextSocketAddressIndex = 0;
   }
 
@@ -250,24 +282,29 @@ public final class RouteSelector {
     return result;
   }
 
-  /** Resets {@link #nextTlsMode} to the first option. */
-  private void resetNextTlsMode() {
-    nextTlsMode = (address.getSslSocketFactory() != null) ? TLS_MODE_MODERN : TLS_MODE_COMPATIBLE;
+  /**
+   * Resets {@link #nextTlsVersion} to the first option. For routes that don't
+   * use SSL, this returns {@link #SSL_V3} so that there is no SSL fallback.
+   */
+  private void resetNextTlsVersion() {
+    nextTlsVersion = (address.getSslSocketFactory() != null) ? TLS_V1 : SSL_V3;
   }
 
-  /** Returns true if there's another TLS mode to try. */
-  private boolean hasNextTlsMode() {
-    return nextTlsMode != TLS_MODE_NULL;
+  /** Returns true if there's another TLS version to try. */
+  private boolean hasNextTlsVersion() {
+    return nextTlsVersion != null;
   }
 
   /** Returns the next TLS mode to try. */
-  private int nextTlsMode() {
-    if (nextTlsMode == TLS_MODE_MODERN) {
-      nextTlsMode = TLS_MODE_COMPATIBLE;
-      return TLS_MODE_MODERN;
-    } else if (nextTlsMode == TLS_MODE_COMPATIBLE) {
-      nextTlsMode = TLS_MODE_NULL;  // So that hasNextTlsMode() returns false.
-      return TLS_MODE_COMPATIBLE;
+  private String nextTlsVersion() {
+    if (nextTlsVersion == null) {
+      throw new IllegalStateException("No next TLS version");
+    } else if (nextTlsVersion.equals(TLS_V1)) {
+      nextTlsVersion = SSL_V3;
+      return TLS_V1;
+    } else if (nextTlsVersion.equals(SSL_V3)) {
+      nextTlsVersion = null;  // So that hasNextTlsVersion() returns false.
+      return SSL_V3;
     } else {
       throw new AssertionError();
     }

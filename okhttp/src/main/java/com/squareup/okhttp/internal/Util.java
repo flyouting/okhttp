@@ -16,14 +16,11 @@
 
 package com.squareup.okhttp.internal;
 
+import com.squareup.okhttp.internal.http.RetryableSink;
 import com.squareup.okhttp.internal.spdy.Header;
-import java.io.ByteArrayInputStream;
 import java.io.Closeable;
-import java.io.EOFException;
 import java.io.File;
 import java.io.IOException;
-import java.io.InputStream;
-import java.io.OutputStream;
 import java.io.UnsupportedEncodingException;
 import java.net.ServerSocket;
 import java.net.Socket;
@@ -37,8 +34,8 @@ import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
 import java.util.concurrent.ThreadFactory;
+import okio.Buffer;
 import okio.ByteString;
-import okio.OkBuffer;
 import okio.Source;
 
 import static java.util.concurrent.TimeUnit.NANOSECONDS;
@@ -47,7 +44,6 @@ import static java.util.concurrent.TimeUnit.NANOSECONDS;
 public final class Util {
   public static final byte[] EMPTY_BYTE_ARRAY = new byte[0];
   public static final String[] EMPTY_STRING_ARRAY = new String[0];
-  public static final InputStream EMPTY_INPUT_STREAM = new ByteArrayInputStream(EMPTY_BYTE_ARRAY);
 
   /** A cheap and type-safe constant for the US-ASCII Charset. */
   public static final Charset US_ASCII = Charset.forName("US-ASCII");
@@ -174,76 +170,17 @@ public final class Util {
     }
   }
 
-  /**
-   * Fills 'dst' with bytes from 'in', throwing EOFException if insufficient bytes are available.
-   */
-  public static void readFully(InputStream in, byte[] dst) throws IOException {
-    readFully(in, dst, 0, dst.length);
-  }
-
-  /**
-   * Reads exactly 'byteCount' bytes from 'in' (into 'dst' at offset 'offset'), and throws
-   * EOFException if insufficient bytes are available.
-   *
-   * Used to implement {@link java.io.DataInputStream#readFully(byte[], int, int)}.
-   */
-  public static void readFully(InputStream in, byte[] dst, int offset, int byteCount)
-      throws IOException {
-    if (byteCount == 0) {
-      return;
-    }
-    if (in == null) {
-      throw new NullPointerException("in == null");
-    }
-    if (dst == null) {
-      throw new NullPointerException("dst == null");
-    }
-    checkOffsetAndCount(dst.length, offset, byteCount);
-    while (byteCount > 0) {
-      int bytesRead = in.read(dst, offset, byteCount);
-      if (bytesRead < 0) {
-        throw new EOFException();
-      }
-      offset += bytesRead;
-      byteCount -= bytesRead;
-    }
-  }
-
-  /** Returns the remainder of 'source' as a buffer, closing it when done. */
-  public static OkBuffer readFully(Source source) throws IOException {
-    OkBuffer result = new OkBuffer();
-    while (source.read(result, 2048) != -1) {
-    }
-    source.close();
-    return result;
-  }
-
   /** Reads until {@code in} is exhausted or the timeout has elapsed. */
   public static boolean skipAll(Source in, int timeoutMillis) throws IOException {
     // TODO: Implement deadlines everywhere so they can do this work.
     long startNanos = System.nanoTime();
-    OkBuffer skipBuffer = new OkBuffer();
+    Buffer skipBuffer = new Buffer();
     while (NANOSECONDS.toMillis(System.nanoTime() - startNanos) < timeoutMillis) {
       long read = in.read(skipBuffer, 2048);
       if (read == -1) return true; // Successfully exhausted the stream.
       skipBuffer.clear();
     }
     return false; // Ran out of time.
-  }
-
-  /**
-   * Copies all of the bytes from {@code in} to {@code out}. Neither stream is closed.
-   * Returns the total number of bytes transferred.
-   */
-  public static int copy(InputStream in, OutputStream out) throws IOException {
-    int total = 0;
-    byte[] buffer = new byte[8192];
-    int c;
-    while ((c = in.read(buffer)) != -1) {
-      total += c;
-      out.write(buffer, 0, c);
-    }
-    return total;
   }
 
   /** Returns a 32 character string containing a hash of {@code s}. */
@@ -261,7 +198,7 @@ public final class Util {
 
   /** Returns an immutable copy of {@code list}. */
   public static <T> List<T> immutableList(List<T> list) {
-    return Collections.unmodifiableList(new ArrayList<T>(list));
+    return Collections.unmodifiableList(new ArrayList<>(list));
   }
 
   /** Returns an immutable list containing {@code elements}. */
@@ -280,10 +217,16 @@ public final class Util {
   }
 
   public static List<Header> headerEntries(String... elements) {
-    List<Header> result = new ArrayList<Header>(elements.length / 2);
+    List<Header> result = new ArrayList<>(elements.length / 2);
     for (int i = 0; i < elements.length; i += 2) {
       result.add(new Header(elements[i], elements[i + 1]));
     }
     return result;
   }
+
+  public static RetryableSink emptySink() {
+    return EMPTY_SINK;
+  }
+
+  private static final RetryableSink EMPTY_SINK = new RetryableSink(0);
 }

@@ -18,19 +18,22 @@ package com.squareup.okhttp;
 import com.squareup.okhttp.internal.RecordingHostnameVerifier;
 import com.squareup.okhttp.internal.SslContextBuilder;
 import com.squareup.okhttp.internal.Util;
-import com.squareup.okhttp.internal.http.HttpAuthenticator;
+import com.squareup.okhttp.internal.http.AuthenticatorAdapter;
 import com.squareup.okhttp.mockwebserver.MockWebServer;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.Proxy;
 import java.util.Arrays;
+import javax.net.SocketFactory;
 import javax.net.ssl.SSLContext;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Test;
 
+import static com.squareup.okhttp.internal.http.RouteSelector.TLS_V1;
 import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertFalse;
 import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
@@ -41,14 +44,15 @@ public final class ConnectionPoolTest {
   private static final int KEEP_ALIVE_DURATION_MS = 5000;
   private static final SSLContext sslContext = SslContextBuilder.localhost();
 
-  private final MockWebServer spdyServer = new MockWebServer();
+  private MockWebServer spdyServer;
   private InetSocketAddress spdySocketAddress;
   private Address spdyAddress;
 
-  private final MockWebServer httpServer = new MockWebServer();
+  private MockWebServer httpServer;
   private Address httpAddress;
   private InetSocketAddress httpSocketAddress;
 
+  private ConnectionPool pool;
   private Connection httpA;
   private Connection httpB;
   private Connection httpC;
@@ -56,65 +60,94 @@ public final class ConnectionPoolTest {
   private Connection httpE;
   private Connection spdyA;
 
+  private Object owner;
+
   @Before public void setUp() throws Exception {
+    setUp(2);
+  }
+
+  private void setUp(int poolSize) throws Exception {
+    SocketFactory socketFactory = SocketFactory.getDefault();
+
+    spdyServer = new MockWebServer();
+    httpServer = new MockWebServer();
     spdyServer.useHttps(sslContext.getSocketFactory(), false);
 
     httpServer.play();
-    httpAddress = new Address(httpServer.getHostName(), httpServer.getPort(), null, null,
-        HttpAuthenticator.SYSTEM_DEFAULT, null, Protocol.SPDY3_AND_HTTP11);
+    httpAddress = new Address(httpServer.getHostName(), httpServer.getPort(), socketFactory, null,
+        null, AuthenticatorAdapter.INSTANCE, null,
+        Util.immutableList(Protocol.SPDY_3, Protocol.HTTP_1_1));
     httpSocketAddress = new InetSocketAddress(InetAddress.getByName(httpServer.getHostName()),
         httpServer.getPort());
 
     spdyServer.play();
-    spdyAddress = new Address(spdyServer.getHostName(), spdyServer.getPort(),
+    spdyAddress = new Address(spdyServer.getHostName(), spdyServer.getPort(), socketFactory,
         sslContext.getSocketFactory(), new RecordingHostnameVerifier(),
-        HttpAuthenticator.SYSTEM_DEFAULT, null,Protocol.SPDY3_AND_HTTP11);
+        AuthenticatorAdapter.INSTANCE, null,
+        Util.immutableList(Protocol.SPDY_3, Protocol.HTTP_1_1));
     spdySocketAddress = new InetSocketAddress(InetAddress.getByName(spdyServer.getHostName()),
         spdyServer.getPort());
 
-    Route httpRoute = new Route(httpAddress, Proxy.NO_PROXY, httpSocketAddress, true);
-    Route spdyRoute = new Route(spdyAddress, Proxy.NO_PROXY, spdySocketAddress, true);
-    httpA = new Connection(null, httpRoute);
-    httpA.connect(200, 200, null);
-    httpB = new Connection(null, httpRoute);
-    httpB.connect(200, 200, null);
-    httpC = new Connection(null, httpRoute);
-    httpC.connect(200, 200, null);
-    httpD = new Connection(null, httpRoute);
-    httpD.connect(200, 200, null);
-    httpE = new Connection(null, httpRoute);
-    httpE.connect(200, 200, null);
-    spdyA = new Connection(null, spdyRoute);
-    spdyA.connect(20000, 20000, null);
+    Route httpRoute = new Route(httpAddress, Proxy.NO_PROXY, httpSocketAddress, TLS_V1);
+    Route spdyRoute = new Route(spdyAddress, Proxy.NO_PROXY, spdySocketAddress, TLS_V1);
+    pool = new ConnectionPool(poolSize, KEEP_ALIVE_DURATION_MS);
+    httpA = new Connection(pool, httpRoute);
+    httpA.connect(200, 200, 200, null);
+    httpB = new Connection(pool, httpRoute);
+    httpB.connect(200, 200, 200, null);
+    httpC = new Connection(pool, httpRoute);
+    httpC.connect(200, 200, 200, null);
+    httpD = new Connection(pool, httpRoute);
+    httpD.connect(200, 200, 200, null);
+    httpE = new Connection(pool, httpRoute);
+    httpE.connect(200, 200, 200, null);
+    spdyA = new Connection(pool, spdyRoute);
+    spdyA.connect(20000, 20000, 2000, null);
+
+    owner = new Object();
+    httpA.setOwner(owner);
+    httpB.setOwner(owner);
+    httpC.setOwner(owner);
+    httpD.setOwner(owner);
+    httpE.setOwner(owner);
   }
 
   @After public void tearDown() throws Exception {
     httpServer.shutdown();
     spdyServer.shutdown();
 
-    Util.closeQuietly(httpA);
-    Util.closeQuietly(httpB);
-    Util.closeQuietly(httpC);
-    Util.closeQuietly(httpD);
-    Util.closeQuietly(httpE);
-    Util.closeQuietly(spdyA);
+    Util.closeQuietly(httpA.getSocket());
+    Util.closeQuietly(httpB.getSocket());
+    Util.closeQuietly(httpC.getSocket());
+    Util.closeQuietly(httpD.getSocket());
+    Util.closeQuietly(httpE.getSocket());
+    Util.closeQuietly(spdyA.getSocket());
   }
 
-  @Test public void poolSingleHttpConnection() throws IOException {
-    ConnectionPool pool = new ConnectionPool(1, KEEP_ALIVE_DURATION_MS);
+  private void resetWithPoolSize(int poolSize) throws Exception {
+    tearDown();
+    setUp(poolSize);
+  }
+
+  @Test public void poolSingleHttpConnection() throws Exception {
+    resetWithPoolSize(1);
     Connection connection = pool.get(httpAddress);
     assertNull(connection);
 
     connection = new Connection(
-        null, new Route(httpAddress, Proxy.NO_PROXY, httpSocketAddress, true));
-    connection.connect(200, 200, null);
+        pool, new Route(httpAddress, Proxy.NO_PROXY, httpSocketAddress, TLS_V1));
+    connection.connect(200, 200, 200, null);
+    connection.setOwner(owner);
     assertEquals(0, pool.getConnectionCount());
+
     pool.recycle(connection);
+    assertNull(connection.getOwner());
     assertEquals(1, pool.getConnectionCount());
     assertEquals(1, pool.getHttpConnectionCount());
     assertEquals(0, pool.getSpdyConnectionCount());
 
     Connection recycledConnection = pool.get(httpAddress);
+    assertNull(connection.getOwner());
     assertEquals(connection, recycledConnection);
     assertTrue(recycledConnection.isAlive());
 
@@ -123,7 +156,6 @@ public final class ConnectionPoolTest {
   }
 
   @Test public void poolPrefersMostRecentlyRecycled() throws Exception {
-    ConnectionPool pool = new ConnectionPool(2, KEEP_ALIVE_DURATION_MS);
     pool.recycle(httpA);
     pool.recycle(httpB);
     pool.recycle(httpC);
@@ -131,21 +163,18 @@ public final class ConnectionPoolTest {
   }
 
   @Test public void getSpdyConnection() throws Exception {
-    ConnectionPool pool = new ConnectionPool(2, KEEP_ALIVE_DURATION_MS);
     pool.share(spdyA);
     assertSame(spdyA, pool.get(spdyAddress));
     assertPooled(pool, spdyA);
   }
 
   @Test public void getHttpConnection() throws Exception {
-    ConnectionPool pool = new ConnectionPool(2, KEEP_ALIVE_DURATION_MS);
     pool.recycle(httpA);
     assertSame(httpA, pool.get(httpAddress));
     assertPooled(pool);
   }
 
   @Test public void idleConnectionNotReturned() throws Exception {
-    ConnectionPool pool = new ConnectionPool(2, KEEP_ALIVE_DURATION_MS);
     pool.recycle(httpA);
     Thread.sleep(KEEP_ALIVE_DURATION_MS * 2);
     assertNull(pool.get(httpAddress));
@@ -153,7 +182,6 @@ public final class ConnectionPoolTest {
   }
 
   @Test public void maxIdleConnectionLimitIsEnforced() throws Exception {
-    ConnectionPool pool = new ConnectionPool(2, KEEP_ALIVE_DURATION_MS);
     pool.recycle(httpA);
     pool.recycle(httpB);
     pool.recycle(httpC);
@@ -162,7 +190,6 @@ public final class ConnectionPoolTest {
   }
 
   @Test public void expiredConnectionsAreEvicted() throws Exception {
-    ConnectionPool pool = new ConnectionPool(2, KEEP_ALIVE_DURATION_MS);
     pool.recycle(httpA);
     pool.recycle(httpB);
     Thread.sleep(2 * KEEP_ALIVE_DURATION_MS);
@@ -171,22 +198,19 @@ public final class ConnectionPoolTest {
   }
 
   @Test public void nonAliveConnectionNotReturned() throws Exception {
-    ConnectionPool pool = new ConnectionPool(2, KEEP_ALIVE_DURATION_MS);
     pool.recycle(httpA);
-    httpA.close();
+    httpA.getSocket().close();
     assertNull(pool.get(httpAddress));
     assertPooled(pool);
   }
 
   @Test public void differentAddressConnectionNotReturned() throws Exception {
-    ConnectionPool pool = new ConnectionPool(2, KEEP_ALIVE_DURATION_MS);
     pool.recycle(httpA);
     assertNull(pool.get(spdyAddress));
     assertPooled(pool, httpA);
   }
 
   @Test public void gettingSpdyConnectionPromotesItToFrontOfQueue() throws Exception {
-    ConnectionPool pool = new ConnectionPool(2, KEEP_ALIVE_DURATION_MS);
     pool.share(spdyA);
     pool.recycle(httpA);
     assertPooled(pool, httpA, spdyA);
@@ -195,21 +219,18 @@ public final class ConnectionPoolTest {
   }
 
   @Test public void gettingConnectionReturnsOldestFirst() throws Exception {
-    ConnectionPool pool = new ConnectionPool(2, KEEP_ALIVE_DURATION_MS);
     pool.recycle(httpA);
     pool.recycle(httpB);
     assertSame(httpA, pool.get(httpAddress));
   }
 
   @Test public void recyclingNonAliveConnectionClosesThatConnection() throws Exception {
-    ConnectionPool pool = new ConnectionPool(2, KEEP_ALIVE_DURATION_MS);
     httpA.getSocket().shutdownInput();
     pool.recycle(httpA); // Should close httpA.
     assertTrue(httpA.getSocket().isClosed());
   }
 
   @Test public void shareHttpConnectionFails() throws Exception {
-    ConnectionPool pool = new ConnectionPool(2, KEEP_ALIVE_DURATION_MS);
     try {
       pool.share(httpA);
       fail();
@@ -219,13 +240,11 @@ public final class ConnectionPoolTest {
   }
 
   @Test public void recycleSpdyConnectionDoesNothing() throws Exception {
-    ConnectionPool pool = new ConnectionPool(2, KEEP_ALIVE_DURATION_MS);
     pool.recycle(spdyA);
     assertPooled(pool);
   }
 
   @Test public void validateIdleSpdyConnectionTimeout() throws Exception {
-    ConnectionPool pool = new ConnectionPool(2, KEEP_ALIVE_DURATION_MS);
     pool.share(spdyA);
     Thread.sleep((int) (KEEP_ALIVE_DURATION_MS * 0.7));
     assertNull(pool.get(httpAddress));
@@ -236,7 +255,6 @@ public final class ConnectionPoolTest {
   }
 
   @Test public void validateIdleHttpConnectionTimeout() throws Exception {
-    ConnectionPool pool = new ConnectionPool(2, KEEP_ALIVE_DURATION_MS);
     pool.recycle(httpA);
     Thread.sleep((int) (KEEP_ALIVE_DURATION_MS * 0.7));
     assertNull(pool.get(spdyAddress));
@@ -247,8 +265,6 @@ public final class ConnectionPoolTest {
   }
 
   @Test public void maxConnections() throws IOException, InterruptedException {
-    ConnectionPool pool = new ConnectionPool(2, KEEP_ALIVE_DURATION_MS);
-
     // Pool should be empty.
     assertEquals(0, pool.getConnectionCount());
 
@@ -280,6 +296,7 @@ public final class ConnectionPoolTest {
 
     // http C should be removed from the pool.
     Connection recycledHttpConnection = pool.get(httpAddress);
+    recycledHttpConnection.setOwner(owner);
     assertNotNull(recycledHttpConnection);
     assertTrue(recycledHttpConnection.isAlive());
     assertEquals(1, pool.getConnectionCount());
@@ -344,7 +361,7 @@ public final class ConnectionPoolTest {
     assertEquals(1, pool.getSpdyConnectionCount());
 
     // Kill http A.
-    Util.closeQuietly(httpA);
+    Util.closeQuietly(httpA.getSocket());
 
     // Force pool to run a clean up.
     assertNotNull(pool.get(spdyAddress));
@@ -366,10 +383,10 @@ public final class ConnectionPoolTest {
     assertEquals(0, pool.getSpdyConnectionCount());
   }
 
-  @Test public void evictAllConnections() {
-    ConnectionPool pool = new ConnectionPool(10, KEEP_ALIVE_DURATION_MS);
+  @Test public void evictAllConnections() throws Exception {
+    resetWithPoolSize(10);
     pool.recycle(httpA);
-    Util.closeQuietly(httpA); // Include a closed connection in the pool.
+    Util.closeQuietly(httpA.getSocket()); // Include a closed connection in the pool.
     pool.recycle(httpB);
     pool.share(spdyA);
     int connectionCount = pool.getConnectionCount();
@@ -377,6 +394,26 @@ public final class ConnectionPoolTest {
 
     pool.evictAll();
     assertEquals(0, pool.getConnectionCount());
+  }
+
+  @Test public void closeIfOwnedBy() throws Exception {
+    httpA.closeIfOwnedBy(owner);
+    assertFalse(httpA.isAlive());
+    assertFalse(httpA.clearOwner());
+  }
+
+  @Test public void closeIfOwnedByDoesNothingIfNotOwner() throws Exception {
+    httpA.closeIfOwnedBy(new Object());
+    assertTrue(httpA.isAlive());
+    assertTrue(httpA.clearOwner());
+  }
+
+  @Test public void closeIfOwnedByFailsForSpdyConnections() throws Exception {
+    try {
+      spdyA.closeIfOwnedBy(owner);
+      fail();
+    } catch (IllegalStateException expected) {
+    }
   }
 
   private void assertPooled(ConnectionPool pool, Connection... connections) throws Exception {

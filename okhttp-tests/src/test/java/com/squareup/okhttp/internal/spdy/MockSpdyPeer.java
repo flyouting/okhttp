@@ -30,9 +30,9 @@ import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
+import okio.Buffer;
 import okio.BufferedSource;
 import okio.ByteString;
-import okio.OkBuffer;
 import okio.Okio;
 
 /** Replays prerecorded outgoing frames and records incoming frames. */
@@ -40,12 +40,12 @@ public final class MockSpdyPeer implements Closeable {
   private int frameCount = 0;
   private boolean client = false;
   private Variant variant = new Spdy3();
-  private final OkBuffer bytesOut = new OkBuffer();
+  private final Buffer bytesOut = new Buffer();
   private FrameWriter frameWriter = variant.newWriter(bytesOut, client);
-  private final List<OutFrame> outFrames = new ArrayList<OutFrame>();
-  private final BlockingQueue<InFrame> inFrames = new LinkedBlockingQueue<InFrame>();
+  private final List<OutFrame> outFrames = new ArrayList<>();
+  private final BlockingQueue<InFrame> inFrames = new LinkedBlockingQueue<>();
   private int port;
-  private final ExecutorService executor = Executors.newCachedThreadPool(
+  private final ExecutorService executor = Executors.newSingleThreadExecutor(
       Util.threadFactory("MockSpdyPeer", false));
   private ServerSocket serverSocket;
   private Socket socket;
@@ -61,6 +61,11 @@ public final class MockSpdyPeer implements Closeable {
 
   public void acceptFrame() {
     frameCount++;
+  }
+
+  /** Maximum length of an outbound data frame. */
+  public int maxOutboundDataLength() {
+    return frameWriter.maxDataLength();
   }
 
   /** Count of frames sent or received. */
@@ -121,7 +126,7 @@ public final class MockSpdyPeer implements Closeable {
     FrameReader reader = variant.newReader(Okio.buffer(Okio.source(in)), client);
 
     Iterator<OutFrame> outFramesIterator = outFrames.iterator();
-    byte[] outBytes = bytesOut.readByteString(bytesOut.size()).toByteArray();
+    byte[] outBytes = bytesOut.readByteArray();
     OutFrame nextOutFrame = null;
 
     for (int i = 0; i < frameCount; i++) {
@@ -192,7 +197,6 @@ public final class MockSpdyPeer implements Closeable {
     public boolean inFinished;
     public int streamId;
     public int associatedStreamId;
-    public int priority;
     public ErrorCode errorCode;
     public long windowSizeIncrement;
     public List<Header> headerBlock;
@@ -222,15 +226,13 @@ public final class MockSpdyPeer implements Closeable {
     }
 
     @Override public void headers(boolean outFinished, boolean inFinished, int streamId,
-        int associatedStreamId, int priority, List<Header> headerBlock,
-        HeadersMode headersMode) {
+        int associatedStreamId, List<Header> headerBlock, HeadersMode headersMode) {
       if (this.type != -1) throw new IllegalStateException();
       this.type = Spdy3.TYPE_HEADERS;
       this.outFinished = outFinished;
       this.inFinished = inFinished;
       this.streamId = streamId;
       this.associatedStreamId = associatedStreamId;
-      this.priority = priority;
       this.headerBlock = headerBlock;
       this.headersMode = headersMode;
     }
@@ -274,16 +276,22 @@ public final class MockSpdyPeer implements Closeable {
       this.windowSizeIncrement = windowSizeIncrement;
     }
 
-    @Override public void priority(int streamId, int priority) {
+    @Override public void priority(int streamId, int streamDependency, int weight,
+        boolean exclusive) {
       throw new UnsupportedOperationException();
     }
 
     @Override
     public void pushPromise(int streamId, int associatedStreamId, List<Header> headerBlock) {
-      this.type = Http20Draft09.TYPE_PUSH_PROMISE;
+      this.type = Http20Draft14.TYPE_PUSH_PROMISE;
       this.streamId = streamId;
       this.associatedStreamId = associatedStreamId;
       this.headerBlock = headerBlock;
+    }
+
+    @Override public void alternateService(int streamId, String origin, ByteString protocol,
+        String host, int port, long maxAge) {
+      throw new UnsupportedOperationException();
     }
   }
 }

@@ -1,16 +1,11 @@
 package com.squareup.okhttp.internal.http;
 
 import com.squareup.okhttp.CacheControl;
-import com.squareup.okhttp.MediaType;
 import com.squareup.okhttp.Request;
 import com.squareup.okhttp.Response;
-import com.squareup.okhttp.ResponseSource;
-import java.io.IOException;
-import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.util.Date;
 
-import static com.squareup.okhttp.internal.Util.EMPTY_INPUT_STREAM;
 import static java.util.concurrent.TimeUnit.SECONDS;
 
 /**
@@ -22,43 +17,19 @@ import static java.util.concurrent.TimeUnit.SECONDS;
  * response (if the cached data is potentially stale).
  */
 public final class CacheStrategy {
-  private static final Response.Body EMPTY_BODY = new Response.Body() {
-    @Override public boolean ready() throws IOException {
-      return true;
-    }
-    @Override public MediaType contentType() {
-      return null;
-    }
-    @Override public long contentLength() {
-      return 0;
-    }
-    @Override public InputStream byteStream() {
-      return EMPTY_INPUT_STREAM;
-    }
-  };
+  /** The request to send on the network, or null if this call doesn't use the network. */
+  public final Request networkRequest;
 
-  private static final StatusLine GATEWAY_TIMEOUT_STATUS_LINE;
-  static {
-    try {
-      GATEWAY_TIMEOUT_STATUS_LINE = new StatusLine("HTTP/1.1 504 Gateway Timeout");
-    } catch (IOException e) {
-      throw new AssertionError();
-    }
-  }
+  /** The cached response to return or validate; or null if this call doesn't use a cache. */
+  public final Response cacheResponse;
 
-  public final Request request;
-  public final Response response;
-  public final ResponseSource source;
-
-  private CacheStrategy(
-      Request request, Response response, ResponseSource source) {
-    this.request = request;
-    this.response = response;
-    this.source = source;
+  private CacheStrategy(Request networkRequest, Response cacheResponse) {
+    this.networkRequest = networkRequest;
+    this.cacheResponse = cacheResponse;
   }
 
   /**
-   * Returns true if this response can be stored to later serve another
+   * Returns true if {@code response} can be stored to later serve another
    * request.
    */
   public static boolean isCacheable(Response response, Request request) {
@@ -164,15 +135,9 @@ public final class CacheStrategy {
     public CacheStrategy get() {
       CacheStrategy candidate = getCandidate();
 
-      if (candidate.source != ResponseSource.CACHE && request.cacheControl().onlyIfCached()) {
-        // We're forbidden from using the network, but the cache is insufficient.
-        Response noneResponse = new Response.Builder()
-            .request(candidate.request)
-            .statusLine(GATEWAY_TIMEOUT_STATUS_LINE)
-            .setResponseSource(ResponseSource.NONE)
-            .body(EMPTY_BODY)
-            .build();
-        return new CacheStrategy(candidate.request, noneResponse, ResponseSource.NONE);
+      if (candidate.networkRequest != null && request.cacheControl().onlyIfCached()) {
+        // We're forbidden from using the network and the cache is insufficient.
+        return new CacheStrategy(null, null);
       }
 
       return candidate;
@@ -182,24 +147,24 @@ public final class CacheStrategy {
     private CacheStrategy getCandidate() {
       // No cached response.
       if (cacheResponse == null) {
-        return new CacheStrategy(request, cacheResponse, ResponseSource.NETWORK);
+        return new CacheStrategy(request, null);
       }
 
       // Drop the cached response if it's missing a required handshake.
       if (request.isHttps() && cacheResponse.handshake() == null) {
-        return new CacheStrategy(request, cacheResponse, ResponseSource.NETWORK);
+        return new CacheStrategy(request, null);
       }
 
       // If this response shouldn't have been stored, it should never be used
       // as a response source. This check should be redundant as long as the
       // persistence store is well-behaved and the rules are constant.
       if (!isCacheable(cacheResponse, request)) {
-        return new CacheStrategy(request, cacheResponse, ResponseSource.NETWORK);
+        return new CacheStrategy(request, null);
       }
 
       CacheControl requestCaching = request.cacheControl();
       if (requestCaching.noCache() || hasConditions(request)) {
-        return new CacheStrategy(request, cacheResponse, ResponseSource.NETWORK);
+        return new CacheStrategy(request, null);
       }
 
       long ageMillis = cacheResponseAge();
@@ -221,8 +186,7 @@ public final class CacheStrategy {
       }
 
       if (!responseCaching.noCache() && ageMillis + minFreshMillis < freshMillis + maxStaleMillis) {
-        Response.Builder builder = cacheResponse.newBuilder()
-            .setResponseSource(ResponseSource.CACHE); // Overwrite any stored response source.
+        Response.Builder builder = cacheResponse.newBuilder();
         if (ageMillis + minFreshMillis >= freshMillis) {
           builder.addHeader("Warning", "110 HttpURLConnection \"Response is stale\"");
         }
@@ -230,7 +194,7 @@ public final class CacheStrategy {
         if (ageMillis > oneDayMillis && isFreshnessLifetimeHeuristic()) {
           builder.addHeader("Warning", "113 HttpURLConnection \"Heuristic expiration\"");
         }
-        return new CacheStrategy(request, builder.build(), ResponseSource.CACHE);
+        return new CacheStrategy(null, builder.build());
       }
 
       Request.Builder conditionalRequestBuilder = request.newBuilder();
@@ -246,10 +210,9 @@ public final class CacheStrategy {
       }
 
       Request conditionalRequest = conditionalRequestBuilder.build();
-      ResponseSource responseSource = hasConditions(conditionalRequest)
-          ? ResponseSource.CONDITIONAL_CACHE
-          : ResponseSource.NETWORK;
-      return new CacheStrategy(conditionalRequest, cacheResponse, responseSource);
+      return hasConditions(conditionalRequest)
+          ? new CacheStrategy(conditionalRequest, cacheResponse)
+          : new CacheStrategy(conditionalRequest, null);
     }
 
     /**

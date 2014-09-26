@@ -15,8 +15,9 @@
  */
 package com.squareup.okhttp.internal.http;
 
-import com.squareup.okhttp.HttpResponseCache;
+import com.squareup.okhttp.Cache;
 import com.squareup.okhttp.OkHttpClient;
+import com.squareup.okhttp.OkUrlFactory;
 import com.squareup.okhttp.Protocol;
 import com.squareup.okhttp.internal.RecordingAuthenticator;
 import com.squareup.okhttp.internal.SslContextBuilder;
@@ -25,11 +26,9 @@ import com.squareup.okhttp.mockwebserver.MockResponse;
 import com.squareup.okhttp.mockwebserver.MockWebServer;
 import com.squareup.okhttp.mockwebserver.RecordedRequest;
 import com.squareup.okhttp.mockwebserver.SocketPolicy;
-import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
-import java.io.OutputStream;
 import java.net.Authenticator;
 import java.net.CookieManager;
 import java.net.HttpURLConnection;
@@ -43,10 +42,13 @@ import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.zip.GZIPOutputStream;
 import javax.net.ssl.HostnameVerifier;
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.SSLSession;
+import okio.Buffer;
+import okio.BufferedSink;
+import okio.GzipSink;
+import okio.Okio;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Ignore;
@@ -79,18 +81,18 @@ public abstract class HttpOverSpdyTest {
   private static final SSLContext sslContext = SslContextBuilder.localhost();
   protected final MockWebServer server = new MockWebServer();
   protected final String hostName = server.getHostName();
-  protected final OkHttpClient client = new OkHttpClient();
+  protected final OkUrlFactory client = new OkUrlFactory(new OkHttpClient());
   protected HttpURLConnection connection;
-  protected HttpResponseCache cache;
+  protected Cache cache;
 
   @Before public void setUp() throws Exception {
     server.useHttps(sslContext.getSocketFactory(), false);
-    client.setProtocols(Arrays.asList(protocol, Protocol.HTTP_11));
-    client.setSslSocketFactory(sslContext.getSocketFactory());
-    client.setHostnameVerifier(NULL_HOSTNAME_VERIFIER);
+    client.client().setProtocols(Arrays.asList(protocol, Protocol.HTTP_1_1));
+    client.client().setSslSocketFactory(sslContext.getSocketFactory());
+    client.client().setHostnameVerifier(NULL_HOSTNAME_VERIFIER);
     String systemTmpDir = System.getProperty("java.io.tmpdir");
     File cacheDir = new File(systemTmpDir, "HttpCache-" + protocol + "-" + UUID.randomUUID());
-    cache = new HttpResponseCache(cacheDir, Integer.MAX_VALUE);
+    cache = new Cache(cacheDir, Integer.MAX_VALUE);
   }
 
   @After public void tearDown() throws Exception {
@@ -224,8 +226,9 @@ public abstract class HttpOverSpdyTest {
   }
 
   @Test public void gzippedResponseBody() throws Exception {
-    server.enqueue(new MockResponse().addHeader("Content-Encoding: gzip")
-        .setBody(gzip("ABCABCABC".getBytes(Util.UTF_8))));
+    server.enqueue(new MockResponse()
+        .addHeader("Content-Encoding: gzip")
+        .setBody(gzip("ABCABCABC")));
     server.play();
     assertContent("ABCABCABC", client.open(server.getUrl("/r1")), Integer.MAX_VALUE);
   }
@@ -329,7 +332,7 @@ public abstract class HttpOverSpdyTest {
       readAscii(connection.getInputStream(), Integer.MAX_VALUE);
       fail("Should have timed out!");
     } catch (IOException e){
-      assertEquals("Read timed out", e.getMessage());
+      assertEquals("timeout", e.getMessage());
     }
   }
 
@@ -349,7 +352,7 @@ public abstract class HttpOverSpdyTest {
   }
 
   @Test public void responsesAreCached() throws IOException {
-    client.setOkResponseCache(cache);
+    client.client().setCache(cache);
 
     server.enqueue(new MockResponse().addHeader("cache-control: max-age=60").setBody("A"));
     server.play();
@@ -366,7 +369,7 @@ public abstract class HttpOverSpdyTest {
   }
 
   @Test public void conditionalCache() throws IOException {
-    client.setOkResponseCache(cache);
+    client.client().setCache(cache);
 
     server.enqueue(new MockResponse().addHeader("ETag: v1").setBody("A"));
     server.enqueue(new MockResponse().setResponseCode(HttpURLConnection.HTTP_NOT_MODIFIED));
@@ -383,7 +386,7 @@ public abstract class HttpOverSpdyTest {
   }
 
   @Test public void responseCachedWithoutConsumingFullBody() throws IOException {
-    client.setOkResponseCache(cache);
+    client.client().setCache(cache);
 
     server.enqueue(new MockResponse().addHeader("cache-control: max-age=60").setBody("ABCD"));
     server.enqueue(new MockResponse().addHeader("cache-control: max-age=60").setBody("EFGH"));
@@ -402,7 +405,7 @@ public abstract class HttpOverSpdyTest {
 
   @Test public void acceptAndTransmitCookies() throws Exception {
     CookieManager cookieManager = new CookieManager();
-    client.setCookieHandler(cookieManager);
+    client.client().setCookieHandler(cookieManager);
     server.enqueue(
         new MockResponse().addHeader("set-cookie: c=oreo; domain=" + server.getCookieDomain())
             .setBody("A"));
@@ -453,12 +456,12 @@ public abstract class HttpOverSpdyTest {
     return result.toString();
   }
 
-  public byte[] gzip(byte[] bytes) throws IOException {
-    ByteArrayOutputStream bytesOut = new ByteArrayOutputStream();
-    OutputStream gzippedOut = new GZIPOutputStream(bytesOut);
-    gzippedOut.write(bytes);
-    gzippedOut.close();
-    return bytesOut.toByteArray();
+  public Buffer gzip(String bytes) throws IOException {
+    Buffer bytesOut = new Buffer();
+    BufferedSink sink = Okio.buffer(new GzipSink(bytesOut));
+    sink.writeUtf8(bytes);
+    sink.close();
+    return bytesOut;
   }
 
   class SpdyRequest implements Runnable {

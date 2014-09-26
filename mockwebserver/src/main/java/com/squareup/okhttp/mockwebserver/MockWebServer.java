@@ -55,6 +55,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.logging.Level;
 import java.util.logging.Logger;
@@ -63,9 +64,10 @@ import javax.net.ssl.SSLSocket;
 import javax.net.ssl.SSLSocketFactory;
 import javax.net.ssl.TrustManager;
 import javax.net.ssl.X509TrustManager;
+import okio.Buffer;
 import okio.BufferedSink;
+import okio.BufferedSource;
 import okio.ByteString;
-import okio.OkBuffer;
 import okio.Okio;
 
 import static com.squareup.okhttp.mockwebserver.SocketPolicy.DISCONNECT_AT_START;
@@ -93,13 +95,11 @@ public final class MockWebServer {
 
   private static final Logger logger = Logger.getLogger(MockWebServer.class.getName());
 
-  private final BlockingQueue<RecordedRequest> requestQueue =
-      new LinkedBlockingQueue<RecordedRequest>();
+  private final BlockingQueue<RecordedRequest> requestQueue = new LinkedBlockingQueue<>();
 
   /** All map values are Boolean.TRUE. (Collections.newSetFromMap isn't available in Froyo) */
-  private final Map<Socket, Boolean> openClientSockets = new ConcurrentHashMap<Socket, Boolean>();
-  private final Map<SpdyConnection, Boolean> openSpdyConnections
-      = new ConcurrentHashMap<SpdyConnection, Boolean>();
+  private final Map<Socket, Boolean> openClientSockets = new ConcurrentHashMap<>();
+  private final Map<SpdyConnection, Boolean> openSpdyConnections = new ConcurrentHashMap<>();
   private final AtomicInteger requestCount = new AtomicInteger();
   private int bodyLimit = Integer.MAX_VALUE;
   private ServerSocket serverSocket;
@@ -109,8 +109,9 @@ public final class MockWebServer {
   private Dispatcher dispatcher = new QueueDispatcher();
 
   private int port = -1;
-  private boolean npnEnabled = true;
-  private List<Protocol> npnProtocols = Protocol.HTTP2_SPDY3_AND_HTTP;
+  private boolean protocolNegotiationEnabled = true;
+  private List<Protocol> protocols
+      = Util.immutableList(Protocol.HTTP_2, Protocol.SPDY_3, Protocol.HTTP_1_1);
 
   public int getPort() {
     if (port == -1) throw new IllegalStateException("Cannot retrieve port before calling play()");
@@ -165,9 +166,19 @@ public final class MockWebServer {
    * Sets whether NPN is used on incoming HTTPS connections to negotiate a
    * protocol like HTTP/1.1 or SPDY/3. Call this method to disable NPN and
    * SPDY.
+   * @deprecated Use {@link #setProtocolNegotiationEnabled}.
    */
   public void setNpnEnabled(boolean npnEnabled) {
-    this.npnEnabled = npnEnabled;
+    this.protocolNegotiationEnabled = npnEnabled;
+  }
+
+  /**
+   * Sets whether ALPN or NPN is used on incoming HTTPS connections to
+   * negotiate a protocol like HTTP/1.1 or HTTP/2. Call this method to disable
+   * negotiation and restrict connections to HTTP/1.1.
+   */
+  public void setProtocolNegotiationEnabled(boolean protocolNegotiationEnabled) {
+    this.protocolNegotiationEnabled = protocolNegotiationEnabled;
   }
 
   /**
@@ -176,16 +187,29 @@ public final class MockWebServer {
    *
    * @param protocols the protocols to use, in order of preference. The list
    *     must contain "http/1.1". It must not contain null.
+   * @deprecated Use {@link #setProtocols(java.util.List)}.
    */
   public void setNpnProtocols(List<Protocol> protocols) {
+    setProtocols(protocols);
+  }
+
+  /**
+   * Indicates the protocols supported by NPN or ALPN on incoming HTTPS
+   * connections. This list is ignored when
+   * {@link #setProtocolNegotiationEnabled negotiation is disabled}.
+   *
+   * @param protocols the protocols to use, in order of preference. The list
+   *     must contain {@linkplain Protocol#HTTP_1_1}. It must not contain null.
+   */
+  public void setProtocols(List<Protocol> protocols) {
     protocols = Util.immutableList(protocols);
-    if (!protocols.contains(Protocol.HTTP_11)) {
+    if (!protocols.contains(Protocol.HTTP_1_1)) {
       throw new IllegalArgumentException("protocols doesn't contain http/1.1: " + protocols);
     }
     if (protocols.contains(null)) {
       throw new IllegalArgumentException("protocols must not contain null");
     }
-    this.npnProtocols = Util.immutableList(protocols);
+    this.protocols = protocols;
   }
 
   /**
@@ -200,10 +224,28 @@ public final class MockWebServer {
 
   /**
    * Awaits the next HTTP request, removes it, and returns it. Callers should
-   * use this to verify the request was sent as intended.
+   * use this to verify the request was sent as intended. This method will block until the
+   * request is available, possibly forever.
+   *
+   * @return the head of the request queue
    */
   public RecordedRequest takeRequest() throws InterruptedException {
     return requestQueue.take();
+  }
+
+  /**
+   * Awaits the next HTTP request (waiting up to the
+   * specified wait time if necessary), removes it, and returns it. Callers should
+   * use this to verify the request was sent as intended within the given time.
+   *
+   * @param timeout how long to wait before giving up, in units of
+  *        {@code unit}
+   * @param unit a {@code TimeUnit} determining how to interpret the
+   *        {@code timeout} parameter
+   * @return the head of the request queue
+   */
+  public RecordedRequest takeRequest(int timeout, TimeUnit unit) throws InterruptedException {
+    return requestQueue.poll(timeout, unit);
   }
 
   /**
@@ -276,7 +318,7 @@ public final class MockWebServer {
           } catch (SocketException e) {
             return;
           }
-          SocketPolicy socketPolicy = dispatcher.peekSocketPolicy();
+          SocketPolicy socketPolicy = dispatcher.peek().getSocketPolicy();
           if (socketPolicy == DISCONNECT_AT_START) {
             dispatchBookkeepingRequest(0, socket);
             socket.close();
@@ -308,13 +350,13 @@ public final class MockWebServer {
       }
 
       public void processConnection() throws Exception {
-        Protocol protocol = Protocol.HTTP_11;
+        Protocol protocol = Protocol.HTTP_1_1;
         Socket socket;
         if (sslSocketFactory != null) {
           if (tunnelProxy) {
             createTunnel();
           }
-          SocketPolicy socketPolicy = dispatcher.peekSocketPolicy();
+          SocketPolicy socketPolicy = dispatcher.peek().getSocketPolicy();
           if (socketPolicy == FAIL_HANDSHAKE) {
             dispatchBookkeepingRequest(sequenceNumber, raw);
             processHandshakeFailure(raw);
@@ -326,22 +368,24 @@ public final class MockWebServer {
           sslSocket.setUseClientMode(false);
           openClientSockets.put(socket, true);
 
-          if (npnEnabled) {
-            Platform.get().setNpnProtocols(sslSocket, npnProtocols);
+          if (protocolNegotiationEnabled) {
+            Platform.get().setProtocols(sslSocket, protocols);
           }
 
           sslSocket.startHandshake();
 
-          if (npnEnabled) {
-            ByteString selectedProtocol = Platform.get().getNpnSelectedProtocol(sslSocket);
-            protocol = Protocol.find(selectedProtocol);
+          if (protocolNegotiationEnabled) {
+            String protocolString = Platform.get().getSelectedProtocol(sslSocket);
+            protocol = protocolString != null
+                ? Protocol.get(protocolString)
+                : Protocol.HTTP_1_1;
           }
           openClientSockets.remove(raw);
         } else {
           socket = raw;
         }
 
-        if (protocol.spdyVariant) {
+        if (protocol != Protocol.HTTP_1_1) {
           SpdySocketHandler spdySocketHandler = new SpdySocketHandler(socket, protocol);
           SpdyConnection spdyConnection = new SpdyConnection.Builder(false, socket)
               .protocol(protocol)
@@ -373,7 +417,7 @@ public final class MockWebServer {
        */
       private void createTunnel() throws IOException, InterruptedException {
         while (true) {
-          SocketPolicy socketPolicy = dispatcher.peekSocketPolicy();
+          SocketPolicy socketPolicy = dispatcher.peek().getSocketPolicy();
           if (!processOneRequest(raw, raw.getInputStream(), raw.getOutputStream())) {
             throw new IllegalStateException("Tunnel without any CONNECT!");
           }
@@ -392,6 +436,10 @@ public final class MockWebServer {
         requestCount.incrementAndGet();
         requestQueue.add(request);
         MockResponse response = dispatcher.dispatch(request);
+        if (response.getSocketPolicy() == SocketPolicy.DISCONNECT_AFTER_REQUEST) {
+          socket.close();
+          return false;
+        }
         writeResponse(out, response);
         if (response.getSocketPolicy() == SocketPolicy.DISCONNECT_AT_END) {
           in.close();
@@ -414,9 +462,8 @@ public final class MockWebServer {
     SSLContext context = SSLContext.getInstance("TLS");
     context.init(null, new TrustManager[] { UNTRUSTED_TRUST_MANAGER }, new SecureRandom());
     SSLSocketFactory sslSocketFactory = context.getSocketFactory();
-    SSLSocket socket =
-        (SSLSocket) sslSocketFactory.createSocket(raw, raw.getInetAddress().getHostAddress(),
-            raw.getPort(), true);
+    SSLSocket socket = (SSLSocket) sslSocketFactory.createSocket(
+        raw, raw.getInetAddress().getHostAddress(), raw.getPort(), true);
     try {
       socket.startHandshake(); // we're testing a handshake failure
       throw new AssertionError();
@@ -444,7 +491,7 @@ public final class MockWebServer {
       return null; // no request because the stream is exhausted
     }
 
-    List<String> headers = new ArrayList<String>();
+    List<String> headers = new ArrayList<>();
     long contentLength = -1;
     boolean chunked = false;
     boolean expectContinue = false;
@@ -474,10 +521,11 @@ public final class MockWebServer {
 
     boolean hasBody = false;
     TruncatingOutputStream requestBody = new TruncatingOutputStream();
-    List<Integer> chunkSizes = new ArrayList<Integer>();
+    List<Integer> chunkSizes = new ArrayList<>();
+    MockResponse throttlePolicy = dispatcher.peek();
     if (contentLength != -1) {
-      hasBody = true;
-      transfer(contentLength, in, requestBody);
+      hasBody = contentLength > 0;
+      throttledTransfer(throttlePolicy, in, requestBody, contentLength);
     } else if (chunked) {
       hasBody = true;
       while (true) {
@@ -487,7 +535,7 @@ public final class MockWebServer {
           break;
         }
         chunkSizes.add(chunkSize);
-        transfer(chunkSize, in, requestBody);
+        throttledTransfer(throttlePolicy, in, requestBody, chunkSize);
         readEmptyLine(in);
       }
     }
@@ -523,40 +571,39 @@ public final class MockWebServer {
 
     InputStream in = response.getBodyStream();
     if (in == null) return;
+    throttledTransfer(response, in, out, Long.MAX_VALUE);
+  }
 
-    // Stream data in MTU-sized increments, sleeping every bytesPerPeriod bytes.
-    byte[] buffer = new byte[1452];
+  /**
+   * Transfer bytes from {@code in} to {@code out} until either {@code length}
+   * bytes have been transferred or {@code in} is exhausted. The transfer is
+   * throttled according to {@code throttlePolicy}.
+   */
+  private void throttledTransfer(MockResponse throttlePolicy, InputStream in, OutputStream out,
+      long limit) throws IOException {
+    byte[] buffer = new byte[1024];
+    int bytesPerPeriod = throttlePolicy.getThrottleBytesPerPeriod();
+    long delayMs = throttlePolicy.getThrottleUnit().toMillis(throttlePolicy.getThrottlePeriod());
+
     while (true) {
-      int bytesPerPeriod = response.getThrottleBytesPerPeriod();
       for (int b = 0; b < bytesPerPeriod; ) {
-        int read = in.read(buffer, 0, Math.min(buffer.length, bytesPerPeriod - b));
+        int toRead = (int) Math.min(Math.min(buffer.length, limit), bytesPerPeriod - b);
+        int read = in.read(buffer, 0, toRead);
         if (read == -1) return;
 
         out.write(buffer, 0, read);
         out.flush();
         b += read;
+        limit -= read;
+
+        if (limit == 0) return;
       }
 
       try {
-        long delayMs = response.getThrottleUnit().toMillis(response.getThrottlePeriod());
         if (delayMs != 0) Thread.sleep(delayMs);
       } catch (InterruptedException e) {
         throw new AssertionError();
       }
-    }
-  }
-
-  /**
-   * Transfer bytes from {@code in} to {@code out} until either {@code length}
-   * bytes have been transferred or {@code in} is exhausted.
-   */
-  private void transfer(long length, InputStream in, OutputStream out) throws IOException {
-    byte[] buffer = new byte[1024];
-    while (length > 0) {
-      int count = in.read(buffer, 0, (int) Math.min(buffer.length, length));
-      if (count == -1) return;
-      out.write(buffer, 0, count);
-      length -= count;
     }
   }
 
@@ -635,13 +682,13 @@ public final class MockWebServer {
       writeResponse(stream, response);
       if (logger.isLoggable(Level.INFO)) {
         logger.info("Received request: " + request + " and responded: " + response
-            + " protocol is " + protocol.name.utf8());
+            + " protocol is " + protocol.toString());
       }
     }
 
     private RecordedRequest readRequest(SpdyStream stream) throws IOException {
       List<Header> spdyHeaders = stream.getRequestHeaders();
-      List<String> httpHeaders = new ArrayList<String>();
+      List<String> httpHeaders = new ArrayList<>();
       String method = "<:method omitted>";
       String path = "<:path omitted>";
       String version = protocol == Protocol.SPDY_3 ? "<:version omitted>" : "HTTP/1.1";
@@ -659,25 +706,21 @@ public final class MockWebServer {
         }
       }
 
-      InputStream bodyIn = Okio.buffer(stream.getSource()).inputStream();
-      ByteArrayOutputStream bodyOut = new ByteArrayOutputStream();
-      byte[] buffer = new byte[8192];
-      int count;
-      while ((count = bodyIn.read(buffer)) != -1) {
-        bodyOut.write(buffer, 0, count);
-      }
+      BufferedSource bodyIn = Okio.buffer(stream.getSource());
+      byte[] bodyOut = bodyIn.readByteArray();
       bodyIn.close();
+
       String requestLine = method + ' ' + path + ' ' + version;
       List<Integer> chunkSizes = Collections.emptyList(); // No chunked encoding for SPDY.
-      return new RecordedRequest(requestLine, httpHeaders, chunkSizes, bodyOut.size(),
-          bodyOut.toByteArray(), sequenceNumber.getAndIncrement(), socket);
+      return new RecordedRequest(requestLine, httpHeaders, chunkSizes, bodyOut.length,
+          bodyOut, sequenceNumber.getAndIncrement(), socket);
     }
 
     private void writeResponse(SpdyStream stream, MockResponse response) throws IOException {
       if (response.getSocketPolicy() == SocketPolicy.NO_RESPONSE) {
         return;
       }
-      List<Header> spdyHeaders = new ArrayList<Header>();
+      List<Header> spdyHeaders = new ArrayList<>();
       String[] statusParts = response.getStatus().split(" ", 2);
       if (statusParts.length != 2) {
         throw new AssertionError("Unexpected status: " + response.getStatus());
@@ -696,10 +739,8 @@ public final class MockWebServer {
         }
         spdyHeaders.add(new Header(headerParts[0], headerParts[1]));
       }
-      OkBuffer body = new OkBuffer();
-      if (response.getBody() != null) {
-        body.write(response.getBody());
-      }
+      Buffer body = response.getBody();
+      if (body == null) body = new Buffer();
       boolean closeStreamAfterHeaders = body.size() > 0 || !response.getPushPromises().isEmpty();
       stream.reply(spdyHeaders, closeStreamAfterHeaders);
       pushPromises(stream, response.getPushPromises());
@@ -713,7 +754,7 @@ public final class MockWebServer {
         }
         BufferedSink sink = Okio.buffer(stream.getSink());
         if (response.getThrottleBytesPerPeriod() == Integer.MAX_VALUE) {
-          sink.write(body, body.size());
+          sink.writeAll(body);
           sink.flush();
         } else {
           while (body.size() > 0) {
@@ -736,7 +777,7 @@ public final class MockWebServer {
 
     private void pushPromises(SpdyStream stream, List<PushPromise> promises) throws IOException {
       for (PushPromise pushPromise : promises) {
-        List<Header> pushedHeaders = new ArrayList<Header>();
+        List<Header> pushedHeaders = new ArrayList<>();
         pushedHeaders.add(new Header(stream.getConnection().getProtocol() == Protocol.SPDY_3
             ? Header.TARGET_HOST
             : Header.TARGET_AUTHORITY, getUrl(pushPromise.getPath()).getHost()));
@@ -754,9 +795,9 @@ public final class MockWebServer {
         List<Integer> chunkSizes = Collections.emptyList(); // No chunked encoding for SPDY.
         requestQueue.add(new RecordedRequest(requestLine, pushPromise.getHeaders(), chunkSizes, 0,
             Util.EMPTY_BYTE_ARRAY, sequenceNumber.getAndIncrement(), socket));
-        byte[] pushedBody = pushPromise.getResponse().getBody();
+        Buffer pushedBody = pushPromise.getResponse().getBody();
         SpdyStream pushedStream =
-            stream.getConnection().pushStream(stream.getId(), pushedHeaders, pushedBody.length > 0);
+            stream.getConnection().pushStream(stream.getId(), pushedHeaders, pushedBody.size() > 0);
         writeResponse(pushedStream, pushPromise.getResponse());
       }
     }
