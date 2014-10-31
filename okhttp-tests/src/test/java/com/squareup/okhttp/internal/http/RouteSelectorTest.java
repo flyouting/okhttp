@@ -18,14 +18,16 @@ package com.squareup.okhttp.internal.http;
 import com.squareup.okhttp.Address;
 import com.squareup.okhttp.Authenticator;
 import com.squareup.okhttp.Connection;
+import com.squareup.okhttp.ConnectionConfiguration;
 import com.squareup.okhttp.ConnectionPool;
-import com.squareup.okhttp.HostResolver;
 import com.squareup.okhttp.OkHttpClient;
 import com.squareup.okhttp.Protocol;
 import com.squareup.okhttp.Request;
 import com.squareup.okhttp.internal.Internal;
+import com.squareup.okhttp.internal.Network;
 import com.squareup.okhttp.internal.RouteDatabase;
 import com.squareup.okhttp.internal.SslContextBuilder;
+import com.squareup.okhttp.internal.Util;
 import java.io.IOException;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
@@ -44,8 +46,6 @@ import javax.net.ssl.SSLSocketFactory;
 import org.junit.Before;
 import org.junit.Test;
 
-import static com.squareup.okhttp.internal.http.RouteSelector.SSL_V3;
-import static com.squareup.okhttp.internal.http.RouteSelector.TLS_V1;
 import static java.net.Proxy.NO_PROXY;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -53,6 +53,11 @@ import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
 
 public final class RouteSelectorTest {
+  public final List<ConnectionConfiguration> connectionConfigurations = Util.immutableList(
+      ConnectionConfiguration.MODERN_TLS,
+      ConnectionConfiguration.COMPATIBLE_TLS,
+      ConnectionConfiguration.CLEARTEXT);
+
   private static final int proxyAPort = 1001;
   private static final String proxyAHost = "proxyA";
   private static final Proxy proxyA =
@@ -89,8 +94,10 @@ public final class RouteSelectorTest {
         .setSslSocketFactory(sslSocketFactory)
         .setHostnameVerifier(hostnameVerifier)
         .setProtocols(protocols)
-        .setConnectionPool(ConnectionPool.getDefault())
-        .setHostResolver(dns);
+        .setConnectionConfigurations(connectionConfigurations)
+        .setConnectionPool(ConnectionPool.getDefault());
+    Internal.instance.setNetwork(client, dns);
+
     routeDatabase = Internal.instance.routeDatabase(client);
 
     httpRequest = new Request.Builder()
@@ -108,7 +115,7 @@ public final class RouteSelectorTest {
     assertTrue(routeSelector.hasNext());
     dns.inetAddresses = makeFakeAddresses(255, 1);
     assertConnection(routeSelector.nextUnconnected(), address, NO_PROXY, dns.inetAddresses[0],
-        uriPort, SSL_V3);
+        uriPort, ConnectionConfiguration.CLEARTEXT);
     dns.assertRequests(uriHost);
 
     assertFalse(routeSelector.hasNext());
@@ -129,7 +136,7 @@ public final class RouteSelectorTest {
     routeDatabase.failed(connection.getRoute());
     routeSelector = RouteSelector.get(httpRequest, client);
     assertConnection(routeSelector.nextUnconnected(), address, NO_PROXY, dns.inetAddresses[0],
-        uriPort, SSL_V3);
+        uriPort, ConnectionConfiguration.CLEARTEXT);
     assertFalse(routeSelector.hasNext());
     try {
       routeSelector.nextUnconnected();
@@ -139,17 +146,17 @@ public final class RouteSelectorTest {
   }
 
   @Test public void explicitProxyTriesThatProxysAddressesOnly() throws Exception {
-    Address address = new Address(uriHost, uriPort, socketFactory, null, null, authenticator,
-        proxyA, protocols);
+    Address address = new Address(uriHost, uriPort, socketFactory, null, null, null, authenticator,
+        proxyA, protocols, connectionConfigurations);
     client.setProxy(proxyA);
     RouteSelector routeSelector = RouteSelector.get(httpRequest, client);
 
     assertTrue(routeSelector.hasNext());
     dns.inetAddresses = makeFakeAddresses(255, 2);
     assertConnection(routeSelector.nextUnconnected(), address, proxyA, dns.inetAddresses[0],
-        proxyAPort, SSL_V3);
+        proxyAPort, ConnectionConfiguration.CLEARTEXT);
     assertConnection(routeSelector.nextUnconnected(), address, proxyA, dns.inetAddresses[1],
-        proxyAPort, SSL_V3);
+        proxyAPort, ConnectionConfiguration.CLEARTEXT);
 
     assertFalse(routeSelector.hasNext());
     dns.assertRequests(proxyAHost);
@@ -157,17 +164,17 @@ public final class RouteSelectorTest {
   }
 
   @Test public void explicitDirectProxy() throws Exception {
-    Address address = new Address(uriHost, uriPort, socketFactory, null, null, authenticator,
-        NO_PROXY, protocols);
+    Address address = new Address(uriHost, uriPort, socketFactory, null, null, null, authenticator,
+        NO_PROXY, protocols, connectionConfigurations);
     client.setProxy(NO_PROXY);
     RouteSelector routeSelector = RouteSelector.get(httpRequest, client);
 
     assertTrue(routeSelector.hasNext());
     dns.inetAddresses = makeFakeAddresses(255, 2);
     assertConnection(routeSelector.nextUnconnected(), address, NO_PROXY, dns.inetAddresses[0],
-        uriPort, SSL_V3);
+        uriPort, ConnectionConfiguration.CLEARTEXT);
     assertConnection(routeSelector.nextUnconnected(), address, NO_PROXY, dns.inetAddresses[1],
-        uriPort, SSL_V3);
+        uriPort, ConnectionConfiguration.CLEARTEXT);
 
     assertFalse(routeSelector.hasNext());
     dns.assertRequests(uriHost);
@@ -184,7 +191,7 @@ public final class RouteSelectorTest {
     assertTrue(routeSelector.hasNext());
     dns.inetAddresses = makeFakeAddresses(255, 1);
     assertConnection(routeSelector.nextUnconnected(), address, NO_PROXY, dns.inetAddresses[0],
-        uriPort, SSL_V3);
+        uriPort, ConnectionConfiguration.CLEARTEXT);
     dns.assertRequests(uriHost);
 
     assertFalse(routeSelector.hasNext());
@@ -197,9 +204,9 @@ public final class RouteSelectorTest {
     assertTrue(routeSelector.hasNext());
     dns.inetAddresses = makeFakeAddresses(255, 2);
     assertConnection(routeSelector.nextUnconnected(), address, NO_PROXY, dns.inetAddresses[0],
-        uriPort, SSL_V3);
+        uriPort, ConnectionConfiguration.CLEARTEXT);
     assertConnection(routeSelector.nextUnconnected(), address, NO_PROXY, dns.inetAddresses[1],
-        uriPort, SSL_V3);
+        uriPort, ConnectionConfiguration.CLEARTEXT);
 
     assertFalse(routeSelector.hasNext());
     dns.assertRequests(uriHost);
@@ -218,23 +225,23 @@ public final class RouteSelectorTest {
     assertTrue(routeSelector.hasNext());
     dns.inetAddresses = makeFakeAddresses(255, 2);
     assertConnection(routeSelector.nextUnconnected(), address, proxyA, dns.inetAddresses[0], proxyAPort,
-        SSL_V3);
+        ConnectionConfiguration.CLEARTEXT);
     assertConnection(routeSelector.nextUnconnected(), address, proxyA, dns.inetAddresses[1], proxyAPort,
-        SSL_V3);
+        ConnectionConfiguration.CLEARTEXT);
     dns.assertRequests(proxyAHost);
 
     // Next try the IP address of the second proxy.
     assertTrue(routeSelector.hasNext());
     dns.inetAddresses = makeFakeAddresses(254, 1);
     assertConnection(routeSelector.nextUnconnected(), address, proxyB, dns.inetAddresses[0], proxyBPort,
-        SSL_V3);
+        ConnectionConfiguration.CLEARTEXT);
     dns.assertRequests(proxyBHost);
 
     // Finally try the only IP address of the origin server.
     assertTrue(routeSelector.hasNext());
     dns.inetAddresses = makeFakeAddresses(253, 1);
     assertConnection(routeSelector.nextUnconnected(), address, NO_PROXY, dns.inetAddresses[0], uriPort,
-        SSL_V3);
+        ConnectionConfiguration.CLEARTEXT);
     dns.assertRequests(uriHost);
 
     assertFalse(routeSelector.hasNext());
@@ -251,7 +258,7 @@ public final class RouteSelectorTest {
     assertTrue(routeSelector.hasNext());
     dns.inetAddresses = makeFakeAddresses(255, 1);
     assertConnection(routeSelector.nextUnconnected(), address, NO_PROXY, dns.inetAddresses[0], uriPort,
-        SSL_V3);
+        ConnectionConfiguration.CLEARTEXT);
     dns.assertRequests(uriHost);
 
     assertFalse(routeSelector.hasNext());
@@ -268,8 +275,8 @@ public final class RouteSelectorTest {
 
     assertTrue(routeSelector.hasNext());
     dns.inetAddresses = makeFakeAddresses(255, 1);
-    assertConnection(routeSelector.nextUnconnected(), address, proxyA, dns.inetAddresses[0], proxyAPort,
-        SSL_V3);
+    assertConnection(routeSelector.nextUnconnected(), address, proxyA, dns.inetAddresses[0],
+        proxyAPort, ConnectionConfiguration.CLEARTEXT);
     dns.assertRequests(proxyAHost);
 
     assertTrue(routeSelector.hasNext());
@@ -283,14 +290,14 @@ public final class RouteSelectorTest {
 
     assertTrue(routeSelector.hasNext());
     dns.inetAddresses = makeFakeAddresses(255, 1);
-    assertConnection(routeSelector.nextUnconnected(), address, proxyA, dns.inetAddresses[0], proxyAPort,
-        SSL_V3);
+    assertConnection(routeSelector.nextUnconnected(), address, proxyA, dns.inetAddresses[0],
+        proxyAPort, ConnectionConfiguration.CLEARTEXT);
     dns.assertRequests(proxyAHost);
 
     assertTrue(routeSelector.hasNext());
     dns.inetAddresses = makeFakeAddresses(254, 1);
-    assertConnection(routeSelector.nextUnconnected(), address, NO_PROXY, dns.inetAddresses[0], uriPort,
-        SSL_V3);
+    assertConnection(routeSelector.nextUnconnected(), address, NO_PROXY, dns.inetAddresses[0],
+        uriPort, ConnectionConfiguration.CLEARTEXT);
     dns.assertRequests(uriHost);
 
     assertFalse(routeSelector.hasNext());
@@ -304,11 +311,11 @@ public final class RouteSelectorTest {
     dns.inetAddresses = makeFakeAddresses(255, 1);
     Connection connection = routeSelector.nextUnconnected();
     routeSelector.connectFailed(connection, new IOException("Non SSL exception"));
-    assertTrue(routeDatabase.failedRoutesCount() == 2);
+    assertEquals(2, routeDatabase.failedRoutesCount());
     assertFalse(routeSelector.hasNext());
   }
 
-  @Test public void sslErrorAddsOnlyFailedTlsModeToFailedRoute() throws Exception {
+  @Test public void sslErrorAddsOnlyFailedConfigurationToFailedRoute() throws Exception {
     client.setProxy(Proxy.NO_PROXY);
     RouteSelector routeSelector = RouteSelector.get(httpsRequest, client);
 
@@ -319,9 +326,9 @@ public final class RouteSelectorTest {
     assertTrue(routeSelector.hasNext());
   }
 
-  @Test public void multipleProxiesMultipleInetAddressesMultipleTlsModes() throws Exception {
+  @Test public void multipleProxiesMultipleInetAddressesMultipleConfigurations() throws Exception {
     Address address = new Address(uriHost, uriPort, socketFactory, sslSocketFactory,
-        hostnameVerifier, authenticator, null, protocols);
+        hostnameVerifier, null, authenticator, null, protocols, connectionConfigurations);
     proxySelector.proxies.add(proxyA);
     proxySelector.proxies.add(proxyB);
     RouteSelector routeSelector = RouteSelector.get(httpsRequest, client);
@@ -329,38 +336,38 @@ public final class RouteSelectorTest {
     // Proxy A
     dns.inetAddresses = makeFakeAddresses(255, 2);
     assertConnection(routeSelector.nextUnconnected(), address, proxyA, dns.inetAddresses[0],
-        proxyAPort, TLS_V1);
+        proxyAPort, ConnectionConfiguration.MODERN_TLS);
     dns.assertRequests(proxyAHost);
     assertConnection(routeSelector.nextUnconnected(), address, proxyA, dns.inetAddresses[0],
-        proxyAPort, SSL_V3);
+        proxyAPort, ConnectionConfiguration.COMPATIBLE_TLS);
     assertConnection(routeSelector.nextUnconnected(), address, proxyA, dns.inetAddresses[1],
-        proxyAPort, TLS_V1);
+        proxyAPort, ConnectionConfiguration.MODERN_TLS);
     assertConnection(routeSelector.nextUnconnected(), address, proxyA, dns.inetAddresses[1],
-        proxyAPort, SSL_V3);
+        proxyAPort, ConnectionConfiguration.COMPATIBLE_TLS);
 
     // Proxy B
     dns.inetAddresses = makeFakeAddresses(254, 2);
     assertConnection(routeSelector.nextUnconnected(), address, proxyB, dns.inetAddresses[0],
-        proxyBPort, TLS_V1);
+        proxyBPort, ConnectionConfiguration.MODERN_TLS);
     dns.assertRequests(proxyBHost);
     assertConnection(routeSelector.nextUnconnected(), address, proxyB, dns.inetAddresses[0],
-        proxyBPort, SSL_V3);
+        proxyBPort, ConnectionConfiguration.COMPATIBLE_TLS);
     assertConnection(routeSelector.nextUnconnected(), address, proxyB, dns.inetAddresses[1],
-        proxyBPort, TLS_V1);
+        proxyBPort, ConnectionConfiguration.MODERN_TLS);
     assertConnection(routeSelector.nextUnconnected(), address, proxyB, dns.inetAddresses[1],
-        proxyBPort, SSL_V3);
+        proxyBPort, ConnectionConfiguration.COMPATIBLE_TLS);
 
     // Origin
     dns.inetAddresses = makeFakeAddresses(253, 2);
     assertConnection(routeSelector.nextUnconnected(), address, NO_PROXY, dns.inetAddresses[0],
-        uriPort, TLS_V1);
+        uriPort, ConnectionConfiguration.MODERN_TLS);
     dns.assertRequests(uriHost);
     assertConnection(routeSelector.nextUnconnected(), address, NO_PROXY, dns.inetAddresses[0],
-        uriPort, SSL_V3);
+        uriPort, ConnectionConfiguration.COMPATIBLE_TLS);
     assertConnection(routeSelector.nextUnconnected(), address, NO_PROXY, dns.inetAddresses[1],
-        uriPort, TLS_V1);
+        uriPort, ConnectionConfiguration.MODERN_TLS);
     assertConnection(routeSelector.nextUnconnected(), address, NO_PROXY, dns.inetAddresses[1],
-        uriPort, SSL_V3);
+        uriPort, ConnectionConfiguration.COMPATIBLE_TLS);
 
     assertFalse(routeSelector.hasNext());
   }
@@ -395,17 +402,18 @@ public final class RouteSelectorTest {
   }
 
   private void assertConnection(Connection connection, Address address, Proxy proxy,
-      InetAddress socketAddress, int socketPort, String tlsVersion) {
+      InetAddress socketAddress, int socketPort, ConnectionConfiguration connectionConfiguration) {
     assertEquals(address, connection.getRoute().getAddress());
     assertEquals(proxy, connection.getRoute().getProxy());
     assertEquals(socketAddress, connection.getRoute().getSocketAddress().getAddress());
     assertEquals(socketPort, connection.getRoute().getSocketAddress().getPort());
-    assertEquals(tlsVersion, connection.getRoute().getTlsVersion());
+    assertEquals(connectionConfiguration, connection.getRoute().getConnectionConfiguration());
   }
 
   /** Returns an address that's without an SSL socket factory or hostname verifier. */
   private Address httpAddress() {
-    return new Address(uriHost, uriPort, socketFactory, null, null, authenticator, null, protocols);
+    return new Address(uriHost, uriPort, socketFactory, null, null, null, authenticator, null,
+        protocols, connectionConfigurations);
   }
 
   private static InetAddress[] makeFakeAddresses(int prefix, int count) {
@@ -421,11 +429,11 @@ public final class RouteSelectorTest {
     }
   }
 
-  private static class FakeDns implements HostResolver {
+  private static class FakeDns implements Network {
     List<String> requestedHosts = new ArrayList<>();
     InetAddress[] inetAddresses;
 
-    @Override public InetAddress[] getAllByName(String host) throws UnknownHostException {
+    @Override public InetAddress[] resolveInetAddresses(String host) throws UnknownHostException {
       requestedHosts.add(host);
       if (inetAddresses == null) throw new UnknownHostException();
       return inetAddresses;

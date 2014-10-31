@@ -16,13 +16,15 @@
 package com.squareup.okhttp.internal.http;
 
 import com.squareup.okhttp.Address;
+import com.squareup.okhttp.CertificatePinner;
 import com.squareup.okhttp.Connection;
+import com.squareup.okhttp.ConnectionConfiguration;
 import com.squareup.okhttp.ConnectionPool;
-import com.squareup.okhttp.HostResolver;
 import com.squareup.okhttp.OkHttpClient;
 import com.squareup.okhttp.Request;
 import com.squareup.okhttp.Route;
 import com.squareup.okhttp.internal.Internal;
+import com.squareup.okhttp.internal.Network;
 import com.squareup.okhttp.internal.RouteDatabase;
 import java.io.IOException;
 import java.net.InetAddress;
@@ -30,10 +32,11 @@ import java.net.InetSocketAddress;
 import java.net.Proxy;
 import java.net.ProxySelector;
 import java.net.SocketAddress;
+import java.net.SocketException;
 import java.net.URI;
 import java.net.UnknownHostException;
 import java.util.ArrayList;
-import java.util.Iterator;
+import java.util.Collections;
 import java.util.List;
 import java.util.NoSuchElementException;
 import javax.net.ssl.HostnameVerifier;
@@ -49,12 +52,9 @@ import static com.squareup.okhttp.internal.Util.getEffectivePort;
  * recycled.
  */
 public final class RouteSelector {
-  public static final String TLS_V1 = "TLSv1";
-  public static final String SSL_V3 = "SSLv3";
-
   private final Address address;
   private final URI uri;
-  private final HostResolver hostResolver;
+  private final Network network;
   private final OkHttpClient client;
   private final ProxySelector proxySelector;
   private final ConnectionPool pool;
@@ -64,19 +64,19 @@ public final class RouteSelector {
   /* The most recently attempted route. */
   private Proxy lastProxy;
   private InetSocketAddress lastInetSocketAddress;
+  private ConnectionConfiguration lastConfiguration;
 
   /* State for negotiating the next proxy to use. */
-  private boolean hasNextProxy;
-  private Proxy userSpecifiedProxy;
-  private Iterator<Proxy> proxySelectorProxies;
+  private List<Proxy> proxies = Collections.emptyList();
+  private int nextProxyIndex;
 
-  /* State for negotiating the next InetSocketAddress to use. */
-  private InetAddress[] socketAddresses;
-  private int nextSocketAddressIndex;
-  private int socketPort;
+  /* State for negotiating the next socket address to use. */
+  private List<InetSocketAddress> inetSocketAddresses = Collections.emptyList();
+  private int nextInetSocketAddressIndex;
 
-  /* TLS version to attempt with the connection. */
-  private String nextTlsVersion;
+  /* TLS configuration to attempt with the connection. */
+  private List<ConnectionConfiguration> connectionConfigurations = Collections.emptyList();
+  private int nextConfigurationIndex;
 
   /* State for negotiating failed routes */
   private final List<Route> postponedRoutes = new ArrayList<>();
@@ -88,7 +88,7 @@ public final class RouteSelector {
     this.proxySelector = client.getProxySelector();
     this.pool = client.getConnectionPool();
     this.routeDatabase = Internal.instance.routeDatabase(client);
-    this.hostResolver = client.getHostResolver();
+    this.network = Internal.instance.network(client);
     this.request = request;
 
     resetNextProxy(uri, address.getProxy());
@@ -102,14 +102,17 @@ public final class RouteSelector {
 
     SSLSocketFactory sslSocketFactory = null;
     HostnameVerifier hostnameVerifier = null;
+    CertificatePinner certificatePinner = null;
     if (request.isHttps()) {
       sslSocketFactory = client.getSslSocketFactory();
       hostnameVerifier = client.getHostnameVerifier();
+      certificatePinner = client.getCertificatePinner();
     }
 
     Address address = new Address(uriHost, getEffectivePort(request.url()),
-        client.getSocketFactory(), sslSocketFactory, hostnameVerifier, client.getAuthenticator(),
-        client.getProxy(), client.getProtocols());
+        client.getSocketFactory(), sslSocketFactory, hostnameVerifier, certificatePinner,
+        client.getAuthenticator(), client.getProxy(), client.getProtocols(),
+        client.getConnectionConfigurations());
 
     return new RouteSelector(address, request.uri(), client, request);
   }
@@ -119,7 +122,7 @@ public final class RouteSelector {
    * least one route.
    */
   public boolean hasNext() {
-    return hasNextTlsVersion()
+    return hasNextConnectionConfiguration()
         || hasNextInetSocketAddress()
         || hasNextProxy()
         || hasNextPostponed();
@@ -145,7 +148,7 @@ public final class RouteSelector {
     }
 
     // Compute the next route to attempt.
-    if (!hasNextTlsVersion()) {
+    if (!hasNextConnectionConfiguration()) {
       if (!hasNextInetSocketAddress()) {
         if (!hasNextProxy()) {
           if (!hasNextPostponed()) {
@@ -154,18 +157,15 @@ public final class RouteSelector {
           return new Connection(pool, nextPostponed());
         }
         lastProxy = nextProxy();
-        resetNextInetSocketAddress(lastProxy);
       }
       lastInetSocketAddress = nextInetSocketAddress();
-      resetNextTlsVersion();
     }
+    lastConfiguration = nextConnectionConfiguration();
 
-    String tlsVersion = nextTlsVersion();
-    Route route = new Route(address, lastProxy, lastInetSocketAddress, tlsVersion);
+    Route route = new Route(address, lastProxy, lastInetSocketAddress, lastConfiguration);
     if (routeDatabase.shouldPostpone(route)) {
       postponedRoutes.add(route);
-      // We will only recurse in order to skip previously failed routes. They will be
-      // tried last.
+      // We will only recurse in order to skip previously failed routes. They will be tried last.
       return nextUnconnected();
     }
 
@@ -188,64 +188,60 @@ public final class RouteSelector {
 
     routeDatabase.failed(failedRoute);
 
-    // If the previously returned route's problem was not related to TLS, and
-    // the next route only changes the TLS mode, we shouldn't even attempt it.
-    // This suppresses it in both this selector and also in the route database.
+    // If the previously returned route's problem was not related to the
+    // connection's configuration, and the next route only changes that, we
+    // shouldn't even attempt it. This suppresses it in both this selector
+    // and also in the route database.
     if (!(failure instanceof SSLHandshakeException) && !(failure instanceof SSLProtocolException)) {
-      while (hasNextTlsVersion()) {
-        Route toSuppress = new Route(address, lastProxy, lastInetSocketAddress, nextTlsVersion());
+      while (nextConfigurationIndex < connectionConfigurations.size()) {
+        Route toSuppress = new Route(address, lastProxy, lastInetSocketAddress,
+            connectionConfigurations.get(nextConfigurationIndex++));
         routeDatabase.failed(toSuppress);
       }
     }
   }
 
-  /** Resets {@link #nextProxy} to the first option. */
+  /** Prepares the proxy servers to try. */
   private void resetNextProxy(URI uri, Proxy proxy) {
-    this.hasNextProxy = true; // This includes NO_PROXY!
     if (proxy != null) {
-      this.userSpecifiedProxy = proxy;
+      // If the user specifies a proxy, try that and only that.
+      proxies = Collections.singletonList(proxy);
     } else {
-      List<Proxy> proxyList = proxySelector.select(uri);
-      if (proxyList != null) {
-        this.proxySelectorProxies = proxyList.iterator();
-      }
+      // Try each of the ProxySelector choices until one connection succeeds. If none succeed
+      // then we'll try a direct connection below.
+      proxies = new ArrayList<>();
+      List<Proxy> selectedProxies = proxySelector.select(uri);
+      if (selectedProxies != null) proxies.addAll(selectedProxies);
+      // Finally try a direct connection. We only try it once!
+      proxies.removeAll(Collections.singleton(Proxy.NO_PROXY));
+      proxies.add(Proxy.NO_PROXY);
     }
+    nextProxyIndex = 0;
   }
 
   /** Returns true if there's another proxy to try. */
   private boolean hasNextProxy() {
-    return hasNextProxy;
+    return nextProxyIndex < proxies.size();
   }
 
   /** Returns the next proxy to try. May be PROXY.NO_PROXY but never null. */
-  private Proxy nextProxy() {
-    // If the user specifies a proxy, try that and only that.
-    if (userSpecifiedProxy != null) {
-      hasNextProxy = false;
-      return userSpecifiedProxy;
+  private Proxy nextProxy() throws IOException {
+    if (!hasNextProxy()) {
+      throw new SocketException("No route to " + address.getUriHost()
+          + "; exhausted proxy configurations: " + proxies);
     }
-
-    // Try each of the ProxySelector choices until one connection succeeds. If none succeed
-    // then we'll try a direct connection below.
-    if (proxySelectorProxies != null) {
-      while (proxySelectorProxies.hasNext()) {
-        Proxy candidate = proxySelectorProxies.next();
-        if (candidate.type() != Proxy.Type.DIRECT) {
-          return candidate;
-        }
-      }
-    }
-
-    // Finally try a direct connection.
-    hasNextProxy = false;
-    return Proxy.NO_PROXY;
+    Proxy result = proxies.get(nextProxyIndex++);
+    resetNextInetSocketAddress(result);
+    return result;
   }
 
-  /** Resets {@link #nextInetSocketAddress} to the first option. */
+  /** Prepares the socket addresses to attempt for the current proxy or host. */
   private void resetNextInetSocketAddress(Proxy proxy) throws UnknownHostException {
-    socketAddresses = null; // Clear the addresses. Necessary if getAllByName() below throws!
+    // Clear the addresses. Necessary if getAllByName() below throws!
+    inetSocketAddresses = new ArrayList<>();
 
     String socketHost;
+    int socketPort;
     if (proxy.type() == Proxy.Type.DIRECT) {
       socketHost = uri.getHost();
       socketPort = getEffectivePort(uri);
@@ -261,53 +257,51 @@ public final class RouteSelector {
     }
 
     // Try each address for best behavior in mixed IPv4/IPv6 environments.
-    socketAddresses = hostResolver.getAllByName(socketHost);
-    nextSocketAddressIndex = 0;
+    for (InetAddress inetAddress : network.resolveInetAddresses(socketHost)) {
+      inetSocketAddresses.add(new InetSocketAddress(inetAddress, socketPort));
+    }
+    nextInetSocketAddressIndex = 0;
   }
 
   /** Returns true if there's another socket address to try. */
   private boolean hasNextInetSocketAddress() {
-    return socketAddresses != null;
+    return nextInetSocketAddressIndex < inetSocketAddresses.size();
   }
 
   /** Returns the next socket address to try. */
-  private InetSocketAddress nextInetSocketAddress() throws UnknownHostException {
-    InetSocketAddress result =
-        new InetSocketAddress(socketAddresses[nextSocketAddressIndex++], socketPort);
-    if (nextSocketAddressIndex == socketAddresses.length) {
-      socketAddresses = null; // So that hasNextInetSocketAddress() returns false.
-      nextSocketAddressIndex = 0;
+  private InetSocketAddress nextInetSocketAddress() throws IOException {
+    if (!hasNextInetSocketAddress()) {
+      throw new SocketException("No route to " + address.getUriHost()
+          + "; exhausted inet socket addresses: " + inetSocketAddresses);
     }
-
+    InetSocketAddress result = inetSocketAddresses.get(nextInetSocketAddressIndex++);
+    resetConnectionConfigurations();
     return result;
   }
 
-  /**
-   * Resets {@link #nextTlsVersion} to the first option. For routes that don't
-   * use SSL, this returns {@link #SSL_V3} so that there is no SSL fallback.
-   */
-  private void resetNextTlsVersion() {
-    nextTlsVersion = (address.getSslSocketFactory() != null) ? TLS_V1 : SSL_V3;
-  }
-
-  /** Returns true if there's another TLS version to try. */
-  private boolean hasNextTlsVersion() {
-    return nextTlsVersion != null;
-  }
-
-  /** Returns the next TLS mode to try. */
-  private String nextTlsVersion() {
-    if (nextTlsVersion == null) {
-      throw new IllegalStateException("No next TLS version");
-    } else if (nextTlsVersion.equals(TLS_V1)) {
-      nextTlsVersion = SSL_V3;
-      return TLS_V1;
-    } else if (nextTlsVersion.equals(SSL_V3)) {
-      nextTlsVersion = null;  // So that hasNextTlsVersion() returns false.
-      return SSL_V3;
-    } else {
-      throw new AssertionError();
+  /** Prepares the connection configurations to attempt. */
+  private void resetConnectionConfigurations() {
+    connectionConfigurations = new ArrayList<>();
+    for (ConnectionConfiguration configuration : address.getConnectionConfigurations()) {
+      if (request.isHttps() == configuration.isTls()) {
+        connectionConfigurations.add(configuration);
+      }
     }
+    nextConfigurationIndex = 0;
+  }
+
+  /** Returns true if there's another connection configuration to try. */
+  private boolean hasNextConnectionConfiguration() {
+    return nextConfigurationIndex < connectionConfigurations.size();
+  }
+
+  /** Returns the next connection configuration to try. */
+  private ConnectionConfiguration nextConnectionConfiguration() throws IOException {
+    if (!hasNextConnectionConfiguration()) {
+      throw new SocketException("No route to " + address.getUriHost()
+          + "; exhausted connection configurations: " + connectionConfigurations);
+    }
+    return connectionConfigurations.get(nextConfigurationIndex++);
   }
 
   /** Returns true if there is another postponed route to try. */

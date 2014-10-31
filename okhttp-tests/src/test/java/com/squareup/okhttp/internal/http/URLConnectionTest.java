@@ -16,9 +16,9 @@
 
 package com.squareup.okhttp.internal.http;
 
-import com.squareup.okhttp.AbstractResponseCache;
 import com.squareup.okhttp.Cache;
 import com.squareup.okhttp.Challenge;
+import com.squareup.okhttp.ConnectionConfiguration;
 import com.squareup.okhttp.ConnectionPool;
 import com.squareup.okhttp.Credentials;
 import com.squareup.okhttp.OkHttpClient;
@@ -29,9 +29,9 @@ import com.squareup.okhttp.internal.Internal;
 import com.squareup.okhttp.internal.RecordingAuthenticator;
 import com.squareup.okhttp.internal.RecordingHostnameVerifier;
 import com.squareup.okhttp.internal.RecordingOkAuthenticator;
+import com.squareup.okhttp.internal.SingleInetAddressNetwork;
 import com.squareup.okhttp.internal.SslContextBuilder;
 import com.squareup.okhttp.internal.Util;
-import com.squareup.okhttp.internal.huc.CacheAdapter;
 import com.squareup.okhttp.mockwebserver.MockResponse;
 import com.squareup.okhttp.mockwebserver.MockWebServer;
 import com.squareup.okhttp.mockwebserver.RecordedRequest;
@@ -41,7 +41,6 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.Authenticator;
-import java.net.CacheRequest;
 import java.net.ConnectException;
 import java.net.HttpRetryException;
 import java.net.HttpURLConnection;
@@ -68,7 +67,6 @@ import java.util.Random;
 import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.zip.GZIPInputStream;
 import javax.net.SocketFactory;
 import javax.net.ssl.HttpsURLConnection;
@@ -89,6 +87,7 @@ import org.junit.Test;
 
 import static com.squareup.okhttp.internal.Util.UTF_8;
 import static com.squareup.okhttp.internal.http.OkHeaders.SELECTED_PROTOCOL;
+import static com.squareup.okhttp.internal.http.StatusLine.HTTP_PERM_REDIRECT;
 import static com.squareup.okhttp.internal.http.StatusLine.HTTP_TEMP_REDIRECT;
 import static com.squareup.okhttp.mockwebserver.SocketPolicy.DISCONNECT_AT_END;
 import static com.squareup.okhttp.mockwebserver.SocketPolicy.DISCONNECT_AT_START;
@@ -855,13 +854,12 @@ public final class URLConnectionTest {
         .setSocketPolicy(SocketPolicy.UPGRADE_TO_SSL_AT_END)
         .setBody("bogus proxy connect response content");
 
-    // Enqueue a pair of responses for every IP address held by localhost, because the
-    // route selector will try each in sequence.
-    // TODO: use the fake Dns implementation instead of a loop
-    for (InetAddress inetAddress : InetAddress.getAllByName(server.getHostName())) {
-      server.enqueue(response); // For the first TLS tolerant connection
-      server.enqueue(response); // For the backwards-compatible SSLv3 retry
-    }
+    // Configure a single IP address for the host and a single configuration, so we only need one
+    // failure to fail permanently.
+    Internal.instance.setNetwork(client.client(), new SingleInetAddressNetwork());
+    client.client().setConnectionConfigurations(
+        Util.immutableList(ConnectionConfiguration.MODERN_TLS));
+    server.enqueue(response);
     server.play();
     client.client().setProxy(server.toProxyAddress());
 
@@ -2002,8 +2000,7 @@ public final class URLConnectionTest {
   }
 
   @Test public void redirectedPostStripsRequestBodyHeaders() throws Exception {
-    server.enqueue(new MockResponse()
-        .setResponseCode(HttpURLConnection.HTTP_MOVED_TEMP)
+    server.enqueue(new MockResponse().setResponseCode(HttpURLConnection.HTTP_MOVED_TEMP)
         .addHeader("Location: /page2"));
     server.enqueue(new MockResponse().setBody("Page 2"));
     server.play();
@@ -2044,24 +2041,40 @@ public final class URLConnectionTest {
   }
 
   @Test public void response307WithGet() throws Exception {
-    test307Redirect("GET");
+    testRedirect(true, "GET");
   }
 
   @Test public void response307WithHead() throws Exception {
-    test307Redirect("HEAD");
+    testRedirect(true, "HEAD");
   }
 
   @Test public void response307WithOptions() throws Exception {
-    test307Redirect("OPTIONS");
+    testRedirect(true, "OPTIONS");
   }
 
   @Test public void response307WithPost() throws Exception {
-    test307Redirect("POST");
+    testRedirect(true, "POST");
   }
 
-  private void test307Redirect(String method) throws Exception {
+  @Test public void response308WithGet() throws Exception {
+    testRedirect(false, "GET");
+  }
+
+  @Test public void response308WithHead() throws Exception {
+    testRedirect(false, "HEAD");
+  }
+
+  @Test public void response308WithOptions() throws Exception {
+    testRedirect(false, "OPTIONS");
+  }
+
+  @Test public void response308WithPost() throws Exception {
+    testRedirect(false, "POST");
+  }
+
+  private void testRedirect(boolean temporary, String method) throws Exception {
     MockResponse response1 = new MockResponse()
-        .setResponseCode(HTTP_TEMP_REDIRECT)
+        .setResponseCode(temporary ? HTTP_TEMP_REDIRECT : HTTP_PERM_REDIRECT)
         .addHeader("Location: /page2");
     if (!method.equals("HEAD")) {
       response1.setBody("This page has moved!");
@@ -2086,9 +2099,9 @@ public final class URLConnectionTest {
     assertEquals(method + " /page1 HTTP/1.1", page1.getRequestLine());
 
     if (method.equals("GET")) {
-        assertEquals("Page 2", response);
+      assertEquals("Page 2", response);
     } else if (method.equals("HEAD"))  {
-        assertEquals("", response);
+      assertEquals("", response);
     } else {
       // Methods other than GET/HEAD shouldn't follow the redirect
       if (method.equals("POST")) {
@@ -2410,33 +2423,6 @@ public final class URLConnectionTest {
       fail();
     } catch (ConnectException expected) {
     }
-  }
-
-  /** Don't explode if the cache returns a null body. http://b/3373699 */
-  @Test public void responseCacheReturnsNullOutputStream() throws Exception {
-    final AtomicBoolean aborted = new AtomicBoolean();
-    Internal.instance.setCache(client.client(), new CacheAdapter(new AbstractResponseCache() {
-      @Override public CacheRequest put(URI uri, URLConnection connection) throws IOException {
-        return new CacheRequest() {
-          @Override public void abort() {
-            aborted.set(true);
-          }
-
-          @Override public OutputStream getBody() throws IOException {
-            return null;
-          }
-        };
-      }
-    }));
-
-    server.enqueue(new MockResponse().setBody("abcdef"));
-    server.play();
-
-    HttpURLConnection connection = client.open(server.getUrl("/"));
-    InputStream in = connection.getInputStream();
-    assertEquals("abc", readAscii(in, 3));
-    in.close();
-    assertFalse(aborted.get()); // The best behavior is ambiguous, but RI 6 doesn't abort here
   }
 
   /** http://code.google.com/p/android/issues/detail?id=14562 */

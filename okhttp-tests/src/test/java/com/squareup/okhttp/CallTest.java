@@ -15,8 +15,10 @@
  */
 package com.squareup.okhttp;
 
+import com.squareup.okhttp.internal.Internal;
 import com.squareup.okhttp.internal.RecordingHostnameVerifier;
 import com.squareup.okhttp.internal.RecordingOkAuthenticator;
+import com.squareup.okhttp.internal.SingleInetAddressNetwork;
 import com.squareup.okhttp.internal.SslContextBuilder;
 import com.squareup.okhttp.mockwebserver.Dispatcher;
 import com.squareup.okhttp.mockwebserver.MockResponse;
@@ -29,7 +31,9 @@ import java.io.InputStream;
 import java.net.CookieManager;
 import java.net.HttpCookie;
 import java.net.HttpURLConnection;
+import java.net.SocketException;
 import java.net.URL;
+import java.security.cert.Certificate;
 import java.util.Arrays;
 import java.util.Collection;
 import java.util.List;
@@ -45,6 +49,8 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLPeerUnverifiedException;
+import javax.net.ssl.SSLProtocolException;
 import okio.Buffer;
 import okio.BufferedSink;
 import okio.BufferedSource;
@@ -55,10 +61,12 @@ import org.junit.Before;
 import org.junit.Ignore;
 import org.junit.Test;
 
+import static com.squareup.okhttp.internal.Internal.logger;
 import static java.lang.Thread.UncaughtExceptionHandler;
 import static java.net.CookiePolicy.ACCEPT_ORIGINAL_SERVER;
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotSame;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertTrue;
 import static org.junit.Assert.fail;
@@ -68,6 +76,7 @@ public final class CallTest {
   private MockWebServer server2 = new MockWebServer();
   private OkHttpClient client = new OkHttpClient();
   private RecordingCallback callback = new RecordingCallback();
+  private TestLogHandler logHandler = new TestLogHandler();
   private UncaughtExceptionHandler defaultUncaughtExceptionHandler;
 
   private static final SSLContext sslContext = SslContextBuilder.localhost();
@@ -78,6 +87,7 @@ public final class CallTest {
     File cacheDir = new File(tmp, "HttpCache-" + UUID.randomUUID());
     cache = new Cache(cacheDir, Integer.MAX_VALUE);
     defaultUncaughtExceptionHandler = Thread.getDefaultUncaughtExceptionHandler();
+    logger.addHandler(logHandler);
   }
 
   @After public void tearDown() throws Exception {
@@ -85,6 +95,7 @@ public final class CallTest {
     server2.shutdown();
     cache.delete();
     Thread.setDefaultUncaughtExceptionHandler(defaultUncaughtExceptionHandler);
+    logger.removeHandler(logHandler);
   }
 
   @Test public void get() throws Exception {
@@ -451,23 +462,13 @@ public final class CallTest {
     assertTrue(server.takeRequest().getHeaders().contains("User-Agent: AsyncApiTest"));
   }
 
-  @Test public void onResponseThrowsIsHandledByUncaughtExceptionHandler() throws Exception {
+  @Test public void exceptionThrownByOnResponseIsRedactedAndLogged() throws Exception {
     server.enqueue(new MockResponse());
     server.play();
 
     Request request = new Request.Builder()
-        .url(server.getUrl("/"))
+        .url(server.getUrl("/secret"))
         .build();
-
-    final AtomicReference<Throwable> uncaughtExceptionRef = new AtomicReference<>();
-    final CountDownLatch latch = new CountDownLatch(1);
-
-    Thread.setDefaultUncaughtExceptionHandler(new UncaughtExceptionHandler() {
-      @Override public void uncaughtException(Thread thread, Throwable throwable) {
-        uncaughtExceptionRef.set(throwable);
-        latch.countDown();
-      }
-    });
 
     client.newCall(request).enqueue(new Callback() {
       @Override public void onFailure(Request request, IOException e) {
@@ -479,11 +480,8 @@ public final class CallTest {
       }
     });
 
-    latch.await();
-    Throwable uncaughtException = uncaughtExceptionRef.get();
-    assertEquals(RuntimeException.class, uncaughtException.getClass());
-    assertEquals(IOException.class, uncaughtException.getCause().getClass());
-    assertEquals("a", uncaughtException.getCause().getMessage());
+    assertEquals("INFO: Callback failure for call to " + server.getUrl("/") + "...",
+        logHandler.take());
   }
 
   @Test public void connectionPooling() throws Exception {
@@ -622,6 +620,7 @@ public final class CallTest {
 
     client.setSslSocketFactory(sslContext.getSocketFactory());
     client.setHostnameVerifier(new RecordingHostnameVerifier());
+    Internal.instance.setNetwork(client, new SingleInetAddressNetwork());
 
     executeSynchronously(new Request.Builder().url(server.getUrl("/")).build())
         .assertBody("abc");
@@ -644,6 +643,43 @@ public final class CallTest {
     callback.await(request.url()).assertBody("abc");
   }
 
+  @Test public void noRecoveryFromTlsHandshakeFailureWhenTlsFallbackIsDisabled() throws Exception {
+    client.setConnectionConfigurations(Arrays.asList(
+        ConnectionConfiguration.MODERN_TLS, ConnectionConfiguration.CLEARTEXT));
+
+    server.useHttps(sslContext.getSocketFactory(), false);
+    server.enqueue(new MockResponse().setSocketPolicy(SocketPolicy.FAIL_HANDSHAKE));
+    server.play();
+
+    client.setSslSocketFactory(sslContext.getSocketFactory());
+    client.setHostnameVerifier(new RecordingHostnameVerifier());
+    Internal.instance.setNetwork(client, new SingleInetAddressNetwork());
+
+    Request request = new Request.Builder().url(server.getUrl("/")).build();
+    try {
+      client.newCall(request).execute();
+      fail();
+    } catch (SSLProtocolException expected) {
+    }
+  }
+
+  @Test public void cleartextCallsFailWhenCleartextIsDisabled() throws Exception {
+    // Configure the client with only TLS configurations. No cleartext!
+    client.setConnectionConfigurations(Arrays.asList(
+        ConnectionConfiguration.MODERN_TLS, ConnectionConfiguration.COMPATIBLE_TLS));
+
+    server.enqueue(new MockResponse());
+    server.play();
+
+    Request request = new Request.Builder().url(server.getUrl("/")).build();
+    try {
+      client.newCall(request).execute();
+      fail();
+    } catch (SocketException expected) {
+      assertTrue(expected.getMessage().contains("exhausted connection configurations"));
+    }
+  }
+
   @Test public void setFollowSslRedirectsFalse() throws Exception {
     server.useHttps(sslContext.getSocketFactory(), false);
     server.enqueue(new MockResponse()
@@ -658,6 +694,51 @@ public final class CallTest {
     Request request = new Request.Builder().url(server.getUrl("/")).build();
     Response response = client.newCall(request).execute();
     assertEquals(301, response.code());
+  }
+
+  @Test public void matchingPinnedCertificate() throws Exception {
+    server.useHttps(sslContext.getSocketFactory(), false);
+    server.enqueue(new MockResponse());
+    server.enqueue(new MockResponse());
+    server.play();
+
+    client.setSslSocketFactory(sslContext.getSocketFactory());
+    client.setHostnameVerifier(new RecordingHostnameVerifier());
+
+    // Make a first request without certificate pinning. Use it to collect certificates to pin.
+    Request request1 = new Request.Builder().url(server.getUrl("/")).build();
+    Response response1 = client.newCall(request1).execute();
+    CertificatePinner.Builder certificatePinnerBuilder = new CertificatePinner.Builder();
+    for (Certificate certificate : response1.handshake().peerCertificates()) {
+      certificatePinnerBuilder.add(server.getHostName(), CertificatePinner.pin(certificate));
+    }
+
+    // Make another request with certificate pinning. It should complete normally.
+    client.setCertificatePinner(certificatePinnerBuilder.build());
+    Request request2 = new Request.Builder().url(server.getUrl("/")).build();
+    Response response2 = client.newCall(request2).execute();
+    assertNotSame(response2.handshake(), response1.handshake());
+  }
+
+  @Test public void unmatchingPinnedCertificate() throws Exception {
+    server.useHttps(sslContext.getSocketFactory(), false);
+    server.enqueue(new MockResponse());
+    server.play();
+
+    client.setSslSocketFactory(sslContext.getSocketFactory());
+    client.setHostnameVerifier(new RecordingHostnameVerifier());
+    client.setCertificatePinner(new CertificatePinner.Builder()
+        .add(server.getHostName(), "sha1/DmxUShsZuNiqPQsX2Oi9uv2sCnw=") // publicobject.com's cert.
+        .build());
+
+    // When we pin the wrong certificate, connectivity fails.
+    Request request = new Request.Builder().url(server.getUrl("/")).build();
+    try {
+      client.newCall(request).execute();
+      fail();
+    } catch (SSLPeerUnverifiedException expected) {
+      assertTrue(expected.getMessage().startsWith("Certificate pinning failure!"));
+    }
   }
 
   @Test public void post_Async() throws Exception {
@@ -1172,6 +1253,33 @@ public final class CallTest {
     assertEquals(1, server.getRequestCount());
   }
 
+  @Test public void cancelInFlightBeforeResponseReadThrowsIOE() throws Exception {
+    server.setDispatcher(new Dispatcher() {
+      @Override public MockResponse dispatch(RecordedRequest request) {
+        client.cancel("request");
+        return new MockResponse().setBody("A");
+      }
+    });
+    server.play();
+
+    Request request = new Request.Builder().url(server.getUrl("/a")).tag("request").build();
+    try {
+      client.newCall(request).execute();
+      fail();
+    } catch (IOException e) {
+    }
+  }
+
+  @Test public void cancelInFlightBeforeResponseReadThrowsIOE_HTTP_2() throws Exception {
+    enableProtocol(Protocol.HTTP_2);
+    cancelInFlightBeforeResponseReadThrowsIOE();
+  }
+
+  @Test public void cancelInFlightBeforeResponseReadThrowsIOE_SPDY_3() throws Exception {
+    enableProtocol(Protocol.SPDY_3);
+    cancelInFlightBeforeResponseReadThrowsIOE();
+  }
+
   /**
    * This test puts a request in front of one that is to be canceled, so that it is canceled before
    * I/O takes place.
@@ -1355,18 +1463,18 @@ public final class CallTest {
     response.body().close();
   }
 
-  @Test public void userAgentIsOmittedByDefault() throws Exception {
+  @Test public void userAgentIsIncludedByDefault() throws Exception {
     server.enqueue(new MockResponse());
     server.play();
 
     executeSynchronously(new Request.Builder().url(server.getUrl("/")).build());
 
     RecordedRequest recordedRequest = server.takeRequest();
-    assertNull(recordedRequest.getHeader("User-Agent"));
+    assertTrue(recordedRequest.getHeader("User-Agent")
+        .matches("okhttp/\\d\\.\\d\\.\\d(-SNAPSHOT)?"));
   }
 
-  @Test
-  public void setFollowRedirectsFalse() throws Exception {
+  @Test public void setFollowRedirectsFalse() throws Exception {
     server.enqueue(new MockResponse()
         .setResponseCode(302)
         .addHeader("Location: /b")

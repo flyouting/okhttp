@@ -21,11 +21,17 @@ import com.squareup.okhttp.internal.http.RecordingProxySelector;
 import com.squareup.okhttp.internal.tls.OkHostnameVerifier;
 import java.io.IOException;
 import java.net.Authenticator;
+import java.net.CacheRequest;
+import java.net.CacheResponse;
 import java.net.CookieHandler;
 import java.net.CookieManager;
 import java.net.ProxySelector;
 import java.net.ResponseCache;
+import java.net.URI;
+import java.net.URLConnection;
 import java.util.Arrays;
+import java.util.List;
+import java.util.Map;
 import javax.net.SocketFactory;
 import org.junit.After;
 import org.junit.Test;
@@ -35,6 +41,7 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertNull;
 import static org.junit.Assert.assertSame;
 import static org.junit.Assert.assertTrue;
+import static org.junit.Assert.fail;
 
 public final class OkHttpClientTest {
   private static final ProxySelector DEFAULT_PROXY_SELECTOR = ProxySelector.getDefault();
@@ -72,6 +79,7 @@ public final class OkHttpClientTest {
     Authenticator authenticator = new RecordingAuthenticator();
     SocketFactory socketFactory = SocketFactory.getDefault(); // Global isn't configurable.
     OkHostnameVerifier hostnameVerifier = OkHostnameVerifier.INSTANCE; // Global isn't configurable.
+    CertificatePinner certificatePinner = CertificatePinner.DEFAULT; // Global isn't configurable.
 
     CookieManager.setDefault(cookieManager);
     ProxySelector.setDefault(proxySelector);
@@ -84,6 +92,7 @@ public final class OkHttpClientTest {
     assertSame(AuthenticatorAdapter.INSTANCE, client.getAuthenticator());
     assertSame(socketFactory, client.getSocketFactory());
     assertSame(hostnameVerifier, client.getHostnameVerifier());
+    assertSame(certificatePinner, client.getCertificatePinner());
   }
 
   /** There is no default cache. */
@@ -92,9 +101,17 @@ public final class OkHttpClientTest {
     assertNull(client.getCache());
   }
 
-  @Test public void copyWithDefaultsDoesNotHonorGlobalResponseCache() throws Exception {
-    ResponseCache responseCache = new AbstractResponseCache();
-    ResponseCache.setDefault(responseCache);
+  @Test public void copyWithDefaultsDoesNotHonorGlobalResponseCache() {
+    ResponseCache.setDefault(new ResponseCache() {
+      @Override public CacheResponse get(URI uri, String requestMethod,
+          Map<String, List<String>> requestHeaders) throws IOException {
+        throw new AssertionError();
+      }
+
+      @Override public CacheRequest put(URI uri, URLConnection connection) {
+        throw new AssertionError();
+      }
+    });
 
     OkHttpClient client = new OkHttpClient().copyWithDefaults();
     assertNull(client.internalCache());
@@ -163,5 +180,14 @@ public final class OkHttpClientTest {
 
     Response actualResponse = mockClient.newCall(request).execute();
     assertSame(response, actualResponse);
+  }
+
+  @Test public void setProtocolsRejectsHttp10() throws Exception {
+    OkHttpClient client = new OkHttpClient();
+    try {
+      client.setProtocols(Arrays.asList(Protocol.HTTP_1_0, Protocol.HTTP_1_1));
+      fail();
+    } catch (IllegalArgumentException expected) {
+    }
   }
 }
